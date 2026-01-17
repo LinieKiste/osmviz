@@ -1,1 +1,2 @@
 bayern-260113.osm.pbf filter=lfs diff=lfs merge=lfs -text
+bayern.pmtiles filter=lfs diff=lfs merge=lfs -text
