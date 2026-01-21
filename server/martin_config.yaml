@@ -1,7 +1,5 @@
 web_ui: enableforall
-pmtiles:
-  sources:
-    bayern: bayern.pmtiles
 mbtiles:
   sources:
-    terrain_raw: euro-dem-tif/data/eurodem_test.mbtiles
+    terrain: euro-dem-tif/data/eurodem_qgis.mbtiles
+    bayern: bayern-shortbread.mbtiles

@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+vulkano = "0.35.2"
 reqwest = {version="0.13.1", features=["blocking", "deflate", "gzip"]}
 mvt-reader = "2.2.0"
 image = "0.25.9"
 anyhow = "1.0.100"
+vulkano-util = "0.35.0"
+vulkano-shaders = "0.35.0"
+glam = "0.30.10"
+winit = "0.30.12"
+
+[profile.dev]
+opt-level = 1

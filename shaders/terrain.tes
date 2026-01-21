@@ -1,0 +1,54 @@
+#version 450
+
+// We are tessellating a Quad, spacing vertices equally, counter-clockwise
+layout(quads, equal_spacing, ccw) in;
+
+layout(location = 0) in vec2 in_tex_coords[];
+layout(location = 0) out vec2 frag_tex_coords;
+
+layout(set = 0, binding = 0) uniform CameraBuffer {
+    mat4 view;
+    mat4 proj;
+    vec3 camera_pos;
+} ubo;
+
+// The Elevation Tile you loaded from Martin
+layout(set = 0, binding = 1) uniform sampler2D heightMap;
+
+void main() {
+    // 1. Calculate the Texture Coordinate for this new vertex
+    // gl_TessCoord.x and .y go from 0.0 to 1.0 across the patch
+    vec2 t00 = in_tex_coords[0];
+    vec2 t01 = in_tex_coords[1]; // Note: Order depends on how you output vertices from Rust
+    vec2 t10 = in_tex_coords[2];
+    vec2 t11 = in_tex_coords[3];
+
+    // Interpolate UVs
+    vec2 uv_bottom = mix(t00, t10, gl_TessCoord.x);
+    vec2 uv_top = mix(t01, t11, gl_TessCoord.x);
+    vec2 tex_coord = mix(uv_bottom, uv_top, gl_TessCoord.y);
+    
+    frag_tex_coords = tex_coord;
+
+    // 2. Sample Height Map (Mapbox RGB Decoding)
+    vec4 color = texture(heightMap, tex_coord);
+    float height = -10000.0 + ((color.r * 255.0 * 256.0 * 256.0 + 
+                                color.g * 255.0 * 256.0 + 
+                                color.b * 255.0) * 0.1);
+    
+    // 3. Interpolate Position
+    vec4 p00 = gl_in[0].gl_Position;
+    vec4 p01 = gl_in[1].gl_Position;
+    vec4 p10 = gl_in[2].gl_Position;
+    vec4 p11 = gl_in[3].gl_Position;
+
+    vec4 pos_bottom = mix(p00, p10, gl_TessCoord.x);
+    vec4 pos_top = mix(p01, p11, gl_TessCoord.x);
+    vec4 pos = mix(pos_bottom, pos_top, gl_TessCoord.y);
+
+    // 4. Displace Upward
+    pos.y += height;
+
+    // 5. Final Projection
+    gl_Position = ubo.proj * ubo.view * pos;
+}
