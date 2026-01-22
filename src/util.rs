@@ -1,6 +1,7 @@
 use crate::App;
 use crate::TerrainVertex;
 use crate::shaders::*;
+use crate::terrain::TileInstance;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 
@@ -72,7 +73,9 @@ impl App {
         let fs = fs::load(self.device.clone())?
             .entry_point("main")
             .unwrap();
-        let vertex_input_state = TerrainVertex::per_vertex().definition(&vs)?;
+        let vertex_input_state =
+            [TerrainVertex::per_vertex(), TileInstance::per_instance()]
+            .definition(&vs)?;
         let stages = [
             PipelineShaderStageCreateInfo::new(vs),
             PipelineShaderStageCreateInfo::new(tcs),
@@ -153,6 +156,7 @@ impl App {
             CommandBufferUsage::OneTimeSubmit,
         )?;
 
+        let instance_buffer = self.terrain.create_instance_buffer(self.memory_allocator.clone());
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -169,8 +173,8 @@ impl App {
             .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())?
             .bind_pipeline_graphics(rcx.pipeline.clone())?
             .bind_descriptor_sets(PipelineBindPoint::Graphics, rcx.pipeline.layout().clone(), 0, descriptor_sets)?
-            .bind_vertex_buffers(0, self.vertex_buffer.clone())?;
-        unsafe { builder.draw(self.vertex_buffer.len() as u32, 1, 0, 0) }?;
+            .bind_vertex_buffers(0, (self.vertex_buffer.clone(), instance_buffer.clone()))?;
+        unsafe { builder.draw(self.vertex_buffer.len() as u32, instance_buffer.len() as u32, 0, 0) }?;
 
         builder.end_render_pass(Default::default())?;
 

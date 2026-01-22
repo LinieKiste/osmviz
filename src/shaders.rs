@@ -3,15 +3,28 @@ pub mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
         src: r"
-        #version 450
-        layout(location = 0) in vec2 position; // 0..1
-        layout(location = 0) out vec2 out_uv;
+            #version 450
+            layout(location = 0) in vec2 position;      // 0..1 Grid Mesh
+            layout(location = 1) in vec2 world_offset;  // Meter offset (Instance)
+            layout(location = 2) in uint texture_layer; // Texture ID (Instance)
 
-        void main() {
-            out_uv = position; 
-            gl_Position = vec4(position.x, 0.0, position.y, 1.0);
-        }
-    ",
+            layout(location = 0) out vec2 out_uv;       // Pass 0..1 to FS for texture sampling
+            layout(location = 1) out flat uint out_layer; 
+
+            // Hardcoded size for now
+            const float TILE_SIZE = 1.0;
+
+            void main() {
+                out_uv = position; 
+                out_layer = texture_layer;
+
+                // TRANSFORM TO WORLD SPACE HERE
+                vec2 world_pos = (position * TILE_SIZE) + world_offset;
+
+                // gl_Position is now in pure World Meters (X, 0, Z)
+                gl_Position = vec4(world_pos.x, 0.0, world_pos.y, 1.0);
+            }
+        ",
     }
 }
 
@@ -20,10 +33,13 @@ pub mod tcs {
         ty: "tess_ctrl",
         src: r"
             #version 450
-            layout(vertices = 4) out; // We are outputting a Quad Patch
+            layout(vertices = 4) out;
 
             layout(location = 0) in vec2 in_uv[];
+            layout(location = 1) in flat uint in_layer[];
+
             layout(location = 0) out vec2 out_uv[];
+            layout(location = 1) out flat uint out_layer[];
 
             layout(set = 0, binding = 0) uniform Camera {
                 mat4 view;
@@ -31,23 +47,23 @@ pub mod tcs {
                 vec3 pos;
             } ubo;
 
-            // LOD Settings
-            const int MIN_TESS_LEVEL = 4;
-            const int MAX_TESS_LEVEL = 256;
-            const float MIN_DISTANCE = 2.0;
-            const float MAX_DISTANCE = 8.0;
-
             void main() {
                 gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
                 out_uv[gl_InvocationID] = in_uv[gl_InvocationID];
+                out_layer[gl_InvocationID] = in_layer[gl_InvocationID];
 
                 if (gl_InvocationID == 0) {
-                    // Calculate distance from camera to the patch center
-                    // Note: We assume the patch is roughly centered at the vertices average
-                    vec4 center = (gl_in[0].gl_Position + gl_in[1].gl_Position + gl_in[2].gl_Position + gl_in[3].gl_Position) / 4.0;
+                    // SIMPLIFIED: gl_in is already in World Space!
+                    // Just average the 4 corners to find the patch center
+                    vec4 center = (gl_in[0].gl_Position + gl_in[1].gl_Position + 
+                                   gl_in[2].gl_Position + gl_in[3].gl_Position) / 4.0;
+                    
                     float dist = distance(ubo.pos, center.xyz);
 
-                    float level = mix(MAX_TESS_LEVEL, MIN_TESS_LEVEL, clamp((dist - MIN_DISTANCE) / (MAX_DISTANCE - MIN_DISTANCE), 0.0, 1.0));
+                    // LOD Calculation (Same logic)
+                    // Closer than 100m = Max Detail (64)
+                    // Further than 3000m = Min Detail (2)
+                    float level = mix(64.0, 2.0, clamp((dist - 3.0) / 15.0, 0.0, 1.0));
 
                     gl_TessLevelOuter[0] = level;
                     gl_TessLevelOuter[1] = level;
@@ -67,51 +83,48 @@ pub mod tes {
         ty: "tess_eval",
         // Displaces vertices based on heightmap (LearnOpenGL 'Tessellation Evaluation Shader')
         src: r"
-        #version 450
-        layout(quads, equal_spacing, ccw) in;
+            #version 450
+            layout(quads, equal_spacing, ccw) in;
 
-        layout(location = 0) in vec2 in_uv[];
-        
-        // Output raw 0..1 height to fragment shader for easier coloring
-        layout(location = 0) out float height_factor; 
-        layout(location = 1) out vec3 v_world_pos;
+            layout(location = 0) in vec2 in_uv[];
+            layout(location = 1) in flat uint in_layer[];
 
-        layout(set = 0, binding = 0) uniform Camera {
-            mat4 view;
-            mat4 proj;
-            vec3 pos;
-        } ubo;
+            layout(location = 0) out float height_factor;
+            layout(location = 1) out vec3 v_world_pos;
 
-        layout(set = 0, binding = 1) uniform sampler2D heightMap;
+            layout(set = 0, binding = 0) uniform Camera {
+                mat4 view;
+                mat4 proj;
+                vec3 pos;
+            } ubo;
 
-        // CONFIG: How tall is the white pixel? (e.g., 500 meters)
-        const float MAX_HEIGHT = 0.7; 
+            layout(set = 0, binding = 1) uniform sampler2DArray heightMap;
 
-        void main() {
-            // 1. Interpolate UVs
-            vec2 u1 = mix(in_uv[0], in_uv[1], gl_TessCoord.x);
-            vec2 u2 = mix(in_uv[3], in_uv[2], gl_TessCoord.x); // CCW order
-            vec2 tex_coord = mix(u1, u2, gl_TessCoord.y);
+            const float MAX_HEIGHT = 0.5; 
 
-            // 2. Read texture
-            float h_factor = texture(heightMap, tex_coord).r;
-            
-            // Pass the 0..1 value to the pixel shader for coloring
-            height_factor = h_factor-0.0; 
+            void main() {
+                // 1. Interpolate UVs (Required for texture lookup)
+                vec2 u1 = mix(in_uv[0], in_uv[1], gl_TessCoord.x);
+                vec2 u2 = mix(in_uv[3], in_uv[2], gl_TessCoord.x);
+                vec2 tex_coord = mix(u1, u2, gl_TessCoord.y);
 
-            // 3. Interpolate Position (X/Z plane)
-            vec4 p1 = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);
-            vec4 p2 = mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x);
-            vec4 pos = mix(p1, p2, gl_TessCoord.y);
+                // 2. Sample Height
+                float h_factor = texture(heightMap, vec3(tex_coord, float(in_layer[0]))).r;
+                height_factor = h_factor; 
 
-            // 4. Displace Upward
-            // We multiply the 0..1 factor by our max height
-            pos.y += h_factor * MAX_HEIGHT; 
+                // 3. Interpolate Position
+                // gl_in[].gl_Position is ALREADY in World Space (X, 0, Z)
+                vec4 p1 = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);
+                vec4 p2 = mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x);
+                vec4 pos = mix(p1, p2, gl_TessCoord.y);
 
-            v_world_pos = pos.xyz;
-            gl_Position = ubo.proj * ubo.view * pos;
-        }
-    ",
+                // 4. Apply Height
+                pos.y += h_factor * MAX_HEIGHT; 
+
+                v_world_pos = pos.xyz;
+                gl_Position = ubo.proj * ubo.view * pos;
+            }
+        ",
     }
 }
 
@@ -146,7 +159,9 @@ pub mod fs {
             vec3 terrain_color;
             
             // Adjust these thresholds to match your specific image contrast
-            if (height_factor < 0.2) {
+            if (height_factor < 0.01) {
+                terrain_color = c_water;
+            } else if (height_factor < 0.2) {
                 // Lowlands (Grass)
                 terrain_color = c_grass;
             } else if (height_factor < 0.4) {

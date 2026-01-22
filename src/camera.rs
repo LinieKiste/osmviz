@@ -59,8 +59,8 @@ impl Camera {
             near: 0.1,
             far: 2000.0,
 
-            speed: 0.5, // Meters per second
-            rot_speed: 0.5,
+            speed: 1.0, // Meters per second
+            rot_speed: 1.0,
             sensitivity: 0.002,
             
             move_forward: false,
@@ -176,5 +176,31 @@ impl Camera {
             position: self.position.to_array(),
             _padding: 0.0,
         }
+    }
+
+    /// Returns the world coordinate where the camera is looking at the ground (Y=0).
+    /// Returns None if looking at the sky or horizon.
+    pub fn intersect_ground(&self) -> Option<Vec3> {
+        // 1. Reconstruct Forward Vector from Yaw/Pitch
+        // (Same math used in get_uniform_data)
+        let (sin_p, cos_p) = self.pitch.sin_cos();
+        let (sin_y, cos_y) = self.yaw.sin_cos();
+
+        let forward = Vec3::new(
+            cos_y * cos_p,
+            sin_p,
+            sin_y * cos_p
+        ).normalize();
+
+        // 2. Check if looking up or parallel (Y must be negative to hit ground)
+        if forward.y >= -0.0001 {
+            return None;
+        }
+
+        // 3. Ray-Plane Intersection (t = -Origin.y / Dir.y)
+        let t = -self.position.y / forward.y;
+
+        // 4. Calculate Hit Point
+        Some(self.position + forward * t)
     }
 }

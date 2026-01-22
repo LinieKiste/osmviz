@@ -27,13 +27,10 @@ use vulkano::{
     }, sync::{self, GpuFuture}
 };
 use winit::{
-    application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowId},
+    application::ApplicationHandler, event::{KeyEvent, WindowEvent}, event_loop::{ActiveEventLoop, EventLoop}, keyboard::{KeyCode, PhysicalKey}, window::{Window, WindowId}
 };
 
-use crate::camera::Camera;
+use crate::{camera::Camera, terrain::Terrain};
 
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
@@ -42,11 +39,12 @@ pub struct TerrainVertex {
     position: [f32; 2],
 }
 
-fn main() -> Result<(), impl Error> {
+fn main() -> Result<()> {
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App::new(&event_loop);
+    let mut app = App::new(&event_loop)?;
 
     event_loop.run_app(&mut app)
+        .context("Failure in event loop")
 }
 
 struct App {
@@ -60,6 +58,7 @@ struct App {
     vertex_buffer: Subbuffer<[TerrainVertex]>,
     rcx: Option<RenderContext>,
     tile_texture: Arc<ImageView>,
+    terrain: Terrain,
 }
 
 struct RenderContext {
@@ -75,7 +74,7 @@ struct RenderContext {
 }
 
 impl App {
-    fn new(event_loop: &EventLoop<()>) -> Self {
+    fn new(event_loop: &EventLoop<()>) -> Result<Self> {
         let library = VulkanLibrary::new().unwrap();
         let required_extensions = Surface::required_extensions(event_loop)
             .unwrap()
@@ -141,10 +140,9 @@ impl App {
                 enabled_features: device_features,
                 ..Default::default()
             },
-        )
-        .unwrap();
+        )?;
 
-        let queue = queues.next().unwrap();
+        let queue = queues.next().context("No available queue found")?;
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
@@ -171,6 +169,7 @@ impl App {
             TerrainVertex { position: [1.0, 1.0] },
             TerrainVertex { position: [0.0, 1.0] }, // CCW Order
         ];
+        let vertices = terrain::generate_patch_grid(4);
         let vertex_buffer = Buffer::from_iter(
             memory_allocator.clone(),
             BufferCreateInfo {
@@ -183,13 +182,13 @@ impl App {
                 ..Default::default()
             },
             vertices,
-        )
-        .unwrap();
+        )?;
 
         // load texture
-        let tile_texture = terrain::load_tile((10, 543, 358),memory_allocator.clone(), queue.clone(), command_buffer_allocator.clone());
+        let mut terrain = Terrain::new();
+        let tile_texture = terrain.upload_heightmaps(memory_allocator.clone(), queue.clone(), command_buffer_allocator.clone())?;
 
-        App {
+        Ok(App {
             instance,
             device,
             queue,
@@ -200,7 +199,8 @@ impl App {
             vertex_buffer,
             rcx: None,
             tile_texture,
-        }
+            terrain,
+        })
     }
 }
 
@@ -208,8 +208,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("osmviz"))
-                .unwrap(),
+                .create_window(Window::default_attributes().with_title("osmviz")).unwrap(),
         );
         let window_size = window.inner_size();
 
@@ -236,8 +235,7 @@ impl ApplicationHandler for App {
                 color: [color],
                 depth_stencil: {depth_stencil},
             },
-        )
-        .unwrap();
+        ).unwrap();
 
         let framebuffers = window_size_dependent_setup(&images, &render_pass, &self.memory_allocator);
 
@@ -277,7 +275,12 @@ impl ApplicationHandler for App {
 
         rcx.camera.handle_input(&event);
         match event {
-            WindowEvent::CloseRequested => {
+            WindowEvent::CloseRequested |
+                WindowEvent::KeyboardInput {
+                    event: KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                    .. },
+                .. } => {
                 event_loop.exit();
             }
             WindowEvent::Resized(_) => {
@@ -309,6 +312,7 @@ impl ApplicationHandler for App {
                 }
 
                 rcx.camera.update(0.016);
+
                 let camera_ubo = {
                     let uniform_data = rcx.camera.get_uniform_data();
 
@@ -319,7 +323,7 @@ impl ApplicationHandler for App {
                 };
                 let sampler = Sampler::new(
                     self.device.clone(),
-                    SamplerCreateInfo::simple_repeat_linear(),
+                    SamplerCreateInfo::default(), // clamps to border
                 ).unwrap();
 
                 let layout = &rcx.pipeline.layout().set_layouts()[0];
