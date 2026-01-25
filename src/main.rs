@@ -2,28 +2,20 @@ mod camera;
 mod shaders;
 mod terrain;
 mod util;
-// Notable elements of this example:
-//
-// - Usage of a tessellation control shader and a tessellation evaluation shader.
-// - `tessellation_shaders` and `tessellation_state` are called on the pipeline builder.
-// - The use of `PrimitiveTopology::PatchList`.
 
-use std::{error::Error, sync::Arc};
+use std::sync::Arc;
 use anyhow::{Result, Context};
-use image::codecs::hdr;
 use vulkano::{
-    Validated, VulkanError, VulkanLibrary, buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer, allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo}}, command_buffer::{
-        AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo, allocator::StandardCommandBufferAllocator
-    }, descriptor_set::{
-        DescriptorBufferInfo, DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator
+    VulkanLibrary, buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer, allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo}}, command_buffer::allocator::StandardCommandBufferAllocator, descriptor_set::{
+        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator
     }, device::{
         Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags, physical::PhysicalDeviceType
     }, format::Format, image::{Image, ImageCreateInfo, ImageType, ImageUsage, sampler::{Sampler, SamplerCreateInfo}, view::ImageView}, instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
-        DynamicState, GraphicsPipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo, graphics::{
-            GraphicsPipelineCreateInfo, color_blend::{ColorBlendAttachmentState, ColorBlendState}, input_assembly::{InputAssemblyState, PrimitiveTopology}, multisample::MultisampleState, rasterization::{PolygonMode, RasterizationState}, tessellation::TessellationState, vertex_input::{Vertex, VertexDefinition}, viewport::{Viewport, ViewportState}
-        }, layout::PipelineDescriptorSetLayoutCreateInfo
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, swapchain::{
-        Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo, acquire_next_image
+        GraphicsPipeline, Pipeline, graphics::{
+            vertex_input::Vertex, viewport::Viewport
+        }
+    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass}, swapchain::{
+        Surface, Swapchain, SwapchainCreateInfo
     }, sync::{self, GpuFuture}
 };
 use winit::{
@@ -57,7 +49,6 @@ struct App {
     memory_allocator: Arc<StandardMemoryAllocator>,
     vertex_buffer: Subbuffer<[TerrainVertex]>,
     rcx: Option<RenderContext>,
-    tile_texture: Arc<ImageView>,
     terrain: Terrain,
 }
 
@@ -185,8 +176,7 @@ impl App {
         )?;
 
         // load texture
-        let mut terrain = Terrain::new();
-        let tile_texture = terrain.upload_heightmaps(memory_allocator.clone(), queue.clone(), command_buffer_allocator.clone())?;
+        let terrain = Terrain::new(memory_allocator.clone(), queue.clone(), command_buffer_allocator.clone())?;
 
         Ok(App {
             instance,
@@ -198,7 +188,6 @@ impl App {
             memory_allocator,
             vertex_buffer,
             rcx: None,
-            tile_texture,
             terrain,
         })
     }
@@ -332,7 +321,7 @@ impl ApplicationHandler for App {
                     layout.clone(),
                     [
                     WriteDescriptorSet::buffer(0, camera_ubo),
-                    WriteDescriptorSet::image_view_sampler(1, self.tile_texture.clone(), sampler),
+                    WriteDescriptorSet::image_view_sampler(1, self.terrain.get_heightmaps(), sampler),
                     ],
                     [],
                 )

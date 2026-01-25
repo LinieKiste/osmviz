@@ -1,16 +1,17 @@
 use crate::TerrainVertex;
 use anyhow::{Result, Context};
+use lru::LruCache;
 
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 use reqwest::blocking::Client;
-use image::{EncodableLayout, ImageBuffer, Luma};
+use image::{ImageBuffer, Luma};
 use vulkano::{
-    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, allocator::StandardCommandBufferAllocator}, device::Queue, format::Format, image::{Image, ImageCreateInfo, ImageType, ImageUsage, view::{ImageView, ImageViewCreateInfo, ImageViewType}}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::graphics::vertex_input::Vertex, sync::GpuFuture
+    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{AutoCommandBufferBuilder, BufferImageCopy, CommandBufferUsage, CopyBufferToImageInfo, allocator::StandardCommandBufferAllocator}, device::Queue, format::Format, image::{Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage, view::{ImageView, ImageViewCreateInfo, ImageViewType}}, memory::allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::graphics::vertex_input::Vertex, sync::GpuFuture
 };
 
 type Gray16Image = ImageBuffer<Luma<u16>, Vec<u16>>;
 
-#[derive(BufferContents, Vertex)]
+#[derive(BufferContents, Vertex, Default)]
 #[repr(C)]
 pub struct TileInstance {
     #[format(R32G32_SFLOAT)]
@@ -21,51 +22,101 @@ pub struct TileInstance {
 }
 
 pub struct Terrain {
+    needs_rebuild: bool,
+    // cpu resources
     origin: (u32, u32),
     zoom_level: u32,
-    heightmap_cache: [Gray16Image; TERRAIN_RADIUS.pow(2) as usize],
-    tile_size_meters: f32,
+    heightmap_cache: LruCache<(u32, u32), Gray16Image>,
+    // gpu resources
+    gpu_resources: TerrainGpuResources,
 }
 
-const TERRAIN_RADIUS: u32 = 15;
+struct TerrainGpuResources {
+    memory_allocator: Arc<StandardMemoryAllocator>,
+    queue: Arc<Queue>,
+    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+
+    instance_buffer: Subbuffer<[TileInstance]>,
+
+    heightmap_array: Arc<Image>,
+    heightmap_array_view: Arc<ImageView>,
+}
+
+/// While the terrain is a square grid, this controls the grid radius
+const TERRAIN_RADIUS: usize = 10;
+/// Resolution of a single heightmap image, retrieved from the server
 const HEIGHTMAP_SIZE: (usize, usize) = (256, 256);
+/// How many images the image array on the GPU can hold
+const IMAGE_BUFFER_SIZE: usize = 101;
+/// Diameter of a single tile
+const TILE_SIZE_METERS: f32 = 1.0;
+
 impl Terrain {
-    pub fn new() -> Self {
-        Terrain { 
+    pub fn new(
+        memory_allocator: Arc<StandardMemoryAllocator>,
+        queue: Arc<Queue>,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        ) -> Result<Self> {
+        let gpu_resources = TerrainGpuResources::new(memory_allocator, queue, command_buffer_allocator)?;
+
+        let mut terrain = Terrain { 
+            needs_rebuild: true,
+            // CPU
             origin: (135, 89),
             zoom_level: 8,
-            heightmap_cache: core::array::from_fn(|_i| Default::default()),
-            tile_size_meters: 1.0,
-        }
+            heightmap_cache: LruCache::new(NonZeroUsize::new(128).unwrap()),
+            // GPU
+            gpu_resources,
+        };
+
+        terrain.update()?;
+
+        Ok(terrain)
     }
 
-    /// Generates the Instance Buffer for the current 4x4 grid
-    pub fn create_instance_buffer(
-        &self,
-        allocator: Arc<StandardMemoryAllocator>,
-    ) -> Subbuffer<[TileInstance]> {
-        let mut instances = Vec::with_capacity(TERRAIN_RADIUS.pow(2) as usize);
+    pub fn get_heightmaps(&self) -> Arc<ImageView> {
+        self.gpu_resources.heightmap_array_view.clone()
+    }
+    pub fn get_instance_buffer(&self) -> Subbuffer<[TileInstance]> {
+        self.gpu_resources.instance_buffer.clone()
+    }
 
-        // Simple 4x4 Grid loop relative to origin
-        for x in 0..TERRAIN_RADIUS {
-            for y in 0..TERRAIN_RADIUS {
-                // Calculate position in world meters
-                // We draw relative to (0,0), so the first tile is at 0, second at 2000, etc.
-                let offset_x = x as f32 * self.tile_size_meters;
-                let offset_y = y as f32 * self.tile_size_meters;
+    /// Update heightmap array and instance buffer
+    pub fn update(&mut self) -> Result<()> {
+        self.load_heightmaps_cpu()
+            .context("Failed to cache heightmaps")?;
+
+        let mut instances = Vec::with_capacity(TERRAIN_RADIUS.pow(2));
+        let mut heightmap_data: Vec<u16> = Vec::new();
+
+        let (o_x, o_y) = self.origin;
+        for (i_x, x) in (o_x..o_x+TERRAIN_RADIUS as u32).enumerate() {
+            for (i_y, y) in (o_y..o_y+TERRAIN_RADIUS as u32).enumerate() {
+                let offset_x = i_x as f32 * TILE_SIZE_METERS;
+                let offset_y = i_y as f32 * TILE_SIZE_METERS;
 
                 // Simple 1:1 mapping of Grid Index -> Texture Layer
-                let layer_index = (x * TERRAIN_RADIUS + y) as u32;
+                let layer_index = (i_x * TERRAIN_RADIUS + i_y) as u32;
 
                 instances.push(TileInstance {
                     world_offset: [offset_x, offset_y],
                     texture_layer: layer_index,
                 });
+
+                heightmap_data.append(
+                    &mut self.heightmap_cache
+                    .get_mut(&(x, y))
+                    .context("Tried to use uncached image")?
+                    .as_raw().clone()
+                    );
             }
         }
 
-        Buffer::from_iter(
-            allocator,
+        self.gpu_resources.upload_heightmaps(heightmap_data)
+            .context("Failed to upload heightmaps to GPU")?;
+
+        self.gpu_resources.instance_buffer = Buffer::from_iter(
+            self.gpu_resources.memory_allocator.clone(),
             BufferCreateInfo { 
                 usage: BufferUsage::VERTEX_BUFFER, 
                 ..Default::default() 
@@ -75,7 +126,11 @@ impl Terrain {
                 ..Default::default() 
             },
             instances,
-        ).unwrap().into()
+        ).unwrap().into();
+
+        self.needs_rebuild = false;
+
+        Ok(())
     }
 
     fn load_heightmaps_cpu(&mut self) -> Result<()> {
@@ -83,9 +138,11 @@ impl Terrain {
         let client = Client::new();
 
         let (o_x, o_y) = self.origin;
-        for x in 0..TERRAIN_RADIUS {
-            for y in 0..TERRAIN_RADIUS {
-                let url = format!("http://localhost:3000/terrain/{}/{}/{}", self.zoom_level, o_x+x, o_y+y);
+        for x in o_x..o_x+TERRAIN_RADIUS as u32 {
+            for y in o_y..o_y+TERRAIN_RADIUS as u32 {
+                if self.heightmap_cache.get(&(x, y)) != None { continue; } // skips if already loaded, but marks as recently used
+
+                let url = format!("http://localhost:3000/terrain/{}/{}/{}", self.zoom_level, x, y);
                 eprintln!("Fetching tile: {}", url);
 
                 let resp = client.get(url).send()
@@ -94,24 +151,74 @@ impl Terrain {
 
                 let img: Gray16Image = image::load_from_memory(&bytes)
                     .context("Failed to decode image")?.to_luma16();
-                self.heightmap_cache[(TERRAIN_RADIUS*x + y) as usize] = img;
+                self.heightmap_cache.put((x, y), img);
             }
         }
         Ok(())
     }
+}
 
-    pub fn upload_heightmaps(
-        &mut self,
-        allocator: Arc<StandardMemoryAllocator>,
+impl TerrainGpuResources {
+
+    pub fn new(
+        memory_allocator: Arc<StandardMemoryAllocator>,
         queue: Arc<Queue>,
         command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-        ) -> Result<Arc<ImageView>> {
+        ) -> Result<Self> {
 
-        self.load_heightmaps_cpu()?;
-        let (width, height) = self.heightmap_cache[0].dimensions();
+        // image
+        let (width, height) = HEIGHTMAP_SIZE;
+        let heightmap_array = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::R16_UNORM,
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                extent: [width as u32, height as u32, 1],
+                array_layers: IMAGE_BUFFER_SIZE as u32,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )?;
 
-        let upload_buffer = vulkano::buffer::Buffer::from_iter(
-            allocator.clone(),
+        let heightmap_array_view = ImageView::new(
+            heightmap_array.clone(),
+            ImageViewCreateInfo {
+                view_type: ImageViewType::Dim2dArray,
+                ..ImageViewCreateInfo::from_image(&heightmap_array)
+            },
+        )?;
+
+        // Garbage init
+        let instance_buffer = Buffer::new_slice(
+            memory_allocator.clone(),
+            BufferCreateInfo { 
+                usage: BufferUsage::VERTEX_BUFFER, 
+                ..Default::default() 
+            },
+            AllocationCreateInfo { 
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE, 
+                ..Default::default() 
+            },
+            (TERRAIN_RADIUS*TERRAIN_RADIUS) as u64,
+        ).unwrap().into();
+
+
+        Ok(TerrainGpuResources {
+            memory_allocator,
+            queue,
+            command_buffer_allocator,
+
+            instance_buffer,
+
+            heightmap_array,
+            heightmap_array_view,
+        })
+    }
+
+    pub fn upload_heightmaps( &mut self, data: Vec<u16>) -> Result<()> {
+        let heightmap_upload_buffer = Buffer::from_iter(
+            self.memory_allocator.clone(),
             vulkano::buffer::BufferCreateInfo {
                 usage: vulkano::buffer::BufferUsage::TRANSFER_SRC,
                 ..Default::default()
@@ -120,123 +227,44 @@ impl Terrain {
                 memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            self.heightmap_cache.iter().map(|x| x.as_raw().clone()) // TODO: remove clone
-            .flatten()
-            .collect::<Vec<u16>>()
-            ,
-        )?;
-
-        let image = Image::new(
-            allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::R16_UNORM,
-                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
-                extent: [width, height, 1],
-                array_layers: TERRAIN_RADIUS.pow(2),
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
+            data.into_iter()
         )?;
 
         let mut builder = AutoCommandBufferBuilder::primary(
-            command_buffer_allocator,
-            queue.queue_family_index(),
+            self.command_buffer_allocator.clone(),
+            self.queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )?;
 
-        builder.copy_buffer_to_image(vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
-                upload_buffer,
-                image.clone(),
-        ))?;
+        let copy_buffer_to_image_info = CopyBufferToImageInfo {
+            regions: [BufferImageCopy {
+                        image_subresource: ImageSubresourceLayers{
+                            array_layers: 0..(TERRAIN_RADIUS*TERRAIN_RADIUS) as u32, // IMPORTANT: only copy layers we can actuall fill
+                            ..self.heightmap_array.subresource_layers()
+                        },
+                        image_extent: self.heightmap_array.extent(),
+                        ..Default::default()
+                    }]
+                    .into(),
+            ..CopyBufferToImageInfo::buffer_image(
+                heightmap_upload_buffer,
+                self.heightmap_array.clone(),
+            )
+        };
+
+        builder.copy_buffer_to_image(copy_buffer_to_image_info)?;
 
         let command_buffer = builder.build()?;
 
         // Execute upload immediately and wait
-        let future = vulkano::sync::now(queue.device().clone())
-            .then_execute(queue.clone(), command_buffer)?
+        let future = vulkano::sync::now(self.queue.device().clone())
+            .then_execute(self.queue.clone(), command_buffer)?
             .then_signal_fence_and_flush()?;
 
         future.wait(None)?;
 
-        let view = ImageView::new(
-            image.clone(),
-            ImageViewCreateInfo {
-                view_type: ImageViewType::Dim2dArray,
-                ..ImageViewCreateInfo::from_image(&image)
-            },
-        )?;
-
-        Ok(view)
+        Ok(())
     }
-}
-
-pub fn load_tile(
-    at: (u32, u32, u32),
-    allocator: Arc<StandardMemoryAllocator>,
-    queue: Arc<Queue>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-) -> Arc<ImageView> {
-    
-    let url = format!("http://localhost:3000/terrain/{}/{}/{}", at.0, at.1, at.2);
-    println!("Fetching tile: {}", url);
-    
-    let client = Client::new();
-    let resp = client.get(url).send().expect("Failed to connect to Martin");
-    let bytes = resp.bytes().expect("Failed to read bytes");
-
-    // 2. Decode Image
-    let img: Gray16Image = image::load_from_memory(&bytes).expect("Failed to decode image").to_luma16();
-    let (width, height) = img.dimensions();
-
-    // 3. Create Vulkan Image (Immutable = Optimized for Shader Reading)
-    let upload_buffer = vulkano::buffer::Buffer::from_iter(
-        allocator.clone(),
-        vulkano::buffer::BufferCreateInfo {
-            usage: vulkano::buffer::BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        img.into_raw(),
-    ).unwrap();
-
-    let image = Image::new(
-        allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format: Format::R16_UNORM,
-            usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
-            extent: [width, height, 1],
-            array_layers: 32,
-            ..Default::default()
-        },
-        AllocationCreateInfo::default(),
-    ).unwrap();
-
-    let mut builder = AutoCommandBufferBuilder::primary(
-        command_buffer_allocator,
-        queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    ).unwrap();
-
-    builder.copy_buffer_to_image(vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
-        upload_buffer,
-        image.clone(),
-    )).unwrap();
-
-    let command_buffer = builder.build().unwrap();
-    
-    // Execute upload immediately and wait
-    let future = vulkano::sync::now(queue.device().clone())
-        .then_execute(queue.clone(), command_buffer).unwrap()
-        .then_signal_fence_and_flush().unwrap();
-        
-    future.wait(None).unwrap();
-
-    ImageView::new_default(image).unwrap()
 }
 
 pub fn generate_patch_grid(subdivisions: u32) -> Vec<TerrainVertex> {

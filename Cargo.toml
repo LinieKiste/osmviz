@@ -13,6 +13,7 @@ vulkano-util = "0.35.0"
 vulkano-shaders = "0.35.0"
 glam = "0.30.10"
 winit = "0.30.12"
+lru = "0.16.3"
 
 [profile.dev]
 opt-level = 1

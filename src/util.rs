@@ -156,7 +156,7 @@ impl App {
             CommandBufferUsage::OneTimeSubmit,
         )?;
 
-        let instance_buffer = self.terrain.create_instance_buffer(self.memory_allocator.clone());
+        let instance_buffer = self.terrain.get_instance_buffer();
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -210,101 +210,3 @@ impl App {
     }
 }
 
-/*
-mod vs {
-    vulkano_shaders::shader! {
-        ty: "vertex",
-        src: r"
-            #version 450
-
-            layout(location = 0) in vec2 position;
-
-            void main() {
-                gl_Position = vec4(position, 0.0, 1.0);
-            }
-        ",
-    }
-}
-
-mod tcs {
-    vulkano_shaders::shader! {
-        ty: "tess_ctrl",
-        src: r"
-            #version 450
-
-            // A value of 3 means a patch consists of a single triangle.
-            layout(vertices = 3) out;
-
-            void main(void) {
-                // Save the position of the patch, so the TES can access it. We could define our
-                // own output variables for this, but `gl_out` is handily provided.
-                gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
-
-                // Many triangles are generated in the center.
-                gl_TessLevelInner[0] = 10;
-                // No triangles are generated for this edge.
-                gl_TessLevelOuter[0] = 1;
-                // Many triangles are generated for this edge.
-                gl_TessLevelOuter[1] = 10;
-                // Many triangles are generated for this edge.
-                gl_TessLevelOuter[2] = 10;
-
-                // These are only used when TES uses `layout(quads)`.
-                // gl_TessLevelInner[1] = ...;
-                // gl_TessLevelOuter[3] = ...;
-            }
-        ",
-    }
-}
-
-// There is a stage in between TCS and TES called Primitive Generation (PG). Shaders cannot be
-// defined for it. It takes `gl_TessLevelInner` and `gl_TessLevelOuter` and uses them to generate
-// positions within the patch and pass them to TES via `gl_TessCoord`.
-//
-// When TES uses `layout(triangles)` then `gl_TessCoord` is in Barycentric coordinates. If
-// `layout(quads)` is used then `gl_TessCoord` is in Cartesian coordinates. Barycentric coordinates
-// are of the form (x, y, z) where x + y + z = 1 and the values x, y and z represent the distance
-// from a vertex of the triangle.
-// https://mathworld.wolfram.com/BarycentricCoordinates.html
-
-mod tes {
-    vulkano_shaders::shader! {
-        ty: "tess_eval",
-        src: r"
-            #version 450
-
-            layout(triangles, equal_spacing, cw) in;
-
-            void main(void) {
-                // Retrieve the vertex positions set by the TCS.
-                vec4 v1 = gl_in[0].gl_Position;
-                vec4 v2 = gl_in[1].gl_Position;
-                vec4 v3 = gl_in[2].gl_Position;
-
-                // Convert `gl_TessCoord` from Barycentric coordinates to Cartesian coordinates.
-                gl_Position = vec4(
-                    gl_TessCoord.x * v1.x + gl_TessCoord.y * v2.x + gl_TessCoord.z * v3.x,
-                    gl_TessCoord.x * v1.y + gl_TessCoord.y * v2.y + gl_TessCoord.z * v3.y,
-                    gl_TessCoord.x * v1.z + gl_TessCoord.y * v2.z + gl_TessCoord.z * v3.z,
-                    1.0
-                );
-            }
-        ",
-    }
-}
-
-mod fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        src: r"
-            #version 450
-
-            layout(location = 0) out vec4 f_color;
-
-            void main() {
-                f_color = vec4(1.0, 1.0, 1.0, 1.0);
-            }
-        ",
-    }
-}
-*/

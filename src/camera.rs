@@ -60,7 +60,7 @@ impl Camera {
             far: 2000.0,
 
             speed: 1.0, // Meters per second
-            rot_speed: 1.0,
+            rot_speed: 0.5,
             sensitivity: 0.002,
             
             move_forward: false,
