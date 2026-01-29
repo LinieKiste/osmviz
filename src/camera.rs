@@ -1,4 +1,6 @@
-use glam::{Mat4, Vec3, Vec4};
+use crate::util;
+
+use glam::{Mat4, UVec3, Vec2, Vec3, Vec3Swizzles, Vec2Swizzles};
 use std::f32::consts::PI;
 use vulkano::buffer::{BufferContents, Subbuffer};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -16,7 +18,8 @@ pub struct CameraUniform {
     pub _padding: f32, // Essential for std140 alignment (vec3 is 16 bytes aligned)
 }
 
-// --- 2. The Logic Controller ---
+/// 1 unit is set as 1 kilometer
+/// We approximate a single zoom 12 tile to have a side length of 10km
 pub struct Camera {
     // Spatial properties
     pub position: Vec3,
@@ -49,8 +52,7 @@ pub struct Camera {
 impl Camera {
     pub fn new(width: f32, height: f32) -> Self {
         Self {
-            // Start high up, looking down
-            position: Vec3::new(0., 2., 2.), 
+            position: Vec3::new(21_720., 10., 14_330.), 
             yaw: -PI / 2.0, // Look along -Z
             pitch: -PI / 4.0, // Look down 45 degrees
             
@@ -59,7 +61,7 @@ impl Camera {
             near: 0.1,
             far: 2000.0,
 
-            speed: 1.0, // Meters per second
+            speed: 5.0, // Meters per second
             rot_speed: 0.5,
             sensitivity: 0.002,
             
@@ -77,8 +79,8 @@ impl Camera {
         }
     }
 
-    pub fn get_zoom_level(&self) -> u8 {
-        22-(self.position.y.max(1.0).ln() as u8).min(20)
+    pub fn get_position(&self) -> Vec3 {
+        self.position.xzy().with_z(12.)
     }
 
     /// Update internal aspect ratio when window resizes
@@ -150,6 +152,8 @@ impl Camera {
 
     /// Construct the matrices and uniform data
     pub fn get_uniform_data(&self) -> CameraUniform {
+        let position = self.position - util::WORLD_ORIGIN.xxy().with_y(0.);
+
         // 1. View Matrix (LookAt)
         // Standard FPS camera math
         let (sin_p, cos_p) = self.pitch.sin_cos();
@@ -161,7 +165,7 @@ impl Camera {
             sin_y * cos_p
         ).normalize();
 
-        let view = Mat4::look_at_rh(self.position, self.position + direction, Vec3::Y);
+        let view = Mat4::look_at_rh(position, position + direction, Vec3::Y);
 
         // 2. Projection Matrix (Perspective)
         let mut proj = Mat4::perspective_rh(self.fov, self.aspect_ratio, self.near, self.far);
@@ -173,7 +177,7 @@ impl Camera {
         CameraUniform {
             view: view.to_cols_array_2d(),
             proj: proj.to_cols_array_2d(),
-            position: self.position.to_array(),
+            position: position.to_array(),
             _padding: 0.0,
         }
     }
@@ -204,3 +208,4 @@ impl Camera {
         Some(self.position + forward * t)
     }
 }
+

@@ -10,7 +10,7 @@ use vulkano::{
         DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator
     }, device::{
         Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags, physical::PhysicalDeviceType
-    }, format::Format, image::{Image, ImageCreateInfo, ImageType, ImageUsage, sampler::{Sampler, SamplerCreateInfo}, view::ImageView}, instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
+    }, format::Format, image::{Image, ImageCreateInfo, ImageType, ImageUsage, sampler::{Filter, Sampler, SamplerCreateInfo}, view::ImageView}, instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::{
         GraphicsPipeline, Pipeline, graphics::{
             vertex_input::Vertex, viewport::Viewport
         }
@@ -154,12 +154,6 @@ impl App {
             },
         );
 
-        let vertices = vec![
-            TerrainVertex { position: [0.0, 0.0] },
-            TerrainVertex { position: [1.0, 0.0] },
-            TerrainVertex { position: [1.0, 1.0] },
-            TerrainVertex { position: [0.0, 1.0] }, // CCW Order
-        ];
         let vertices = terrain::generate_patch_grid(4);
         let vertex_buffer = Buffer::from_iter(
             memory_allocator.clone(),
@@ -302,6 +296,10 @@ impl ApplicationHandler for App {
 
                 rcx.camera.update(0.016);
 
+                self.terrain.set_origin(rcx.camera.get_position());
+                self.terrain.update()
+                    .expect("Terrain update failed");
+
                 let camera_ubo = {
                     let uniform_data = rcx.camera.get_uniform_data();
 
@@ -312,7 +310,11 @@ impl ApplicationHandler for App {
                 };
                 let sampler = Sampler::new(
                     self.device.clone(),
-                    SamplerCreateInfo::default(), // clamps to border
+                    SamplerCreateInfo {
+                        min_filter: Filter::Linear,
+                        mag_filter: Filter::Linear,
+                        ..SamplerCreateInfo::default() // clamps to border
+                },
                 ).unwrap();
 
                 let layout = &rcx.pipeline.layout().set_layouts()[0];
@@ -321,7 +323,8 @@ impl ApplicationHandler for App {
                     layout.clone(),
                     [
                     WriteDescriptorSet::buffer(0, camera_ubo),
-                    WriteDescriptorSet::image_view_sampler(1, self.terrain.get_heightmaps(), sampler),
+                    WriteDescriptorSet::image_view_sampler(1, self.terrain.get_heightmaps(), sampler.clone()),
+                    WriteDescriptorSet::image_view_sampler(2, self.terrain.get_colormaps(), sampler),
                     ],
                     [],
                 )

@@ -6,3 +6,5 @@ The best thing since sliced bread
 [Geofabrik](https://download.geofabrik.de/europe/germany/bayern.html), pmtiles generated with [tilemaker](https://github.com/systemed/tilemaker)
 #### Elevation data
 [EuroDEM dataset](https://www.mapsforeurope.org/datasets/euro-dem)
+#### Color data
+<a xmlns:dct="http://purl.org/dc/terms/" href="https://s2maps.eu" property="dct:title">Sentinel-2 cloudless - https://s2maps.eu</a> by <a xmlns:cc="http://creativecommons.org/ns#" href="https://eox.at" property="cc:attributionName" rel="cc:attributionURL">EOX IT Services GmbH</a> (Contains modified Copernicus Sentinel data 2016 &amp; 2017) released under <a rel="license" href="https://creativecommons.org/licenses/by/4.0/">Creative Commons Attribution 4.0 International License</a>.

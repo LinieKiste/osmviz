@@ -5,6 +5,9 @@ use crate::terrain::TileInstance;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 
+use glam::UVec3;
+use glam::Vec2;
+use glam::Vec3;
 use vulkano::Validated;
 use vulkano::VulkanError;
 use vulkano::command_buffer::AutoCommandBufferBuilder;
@@ -16,11 +19,10 @@ use vulkano::pipeline::PipelineBindPoint;
 use vulkano::pipeline::graphics::depth_stencil::DepthState;
 use vulkano::pipeline::graphics::depth_stencil::DepthStencilState;
 use vulkano::pipeline::graphics::rasterization::CullMode;
-use vulkano::pipeline::graphics::rasterization::FrontFace;
 use vulkano::swapchain::SwapchainPresentInfo;
 use vulkano::swapchain::acquire_next_image;
 use vulkano::{
-    buffer::BufferContents, image::{Image, ImageUsage},
+    image::{Image, ImageUsage},
     sync::{self, GpuFuture},
     pipeline::{
         DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo, graphics::{
@@ -29,6 +31,8 @@ use vulkano::{
     }, render_pass::{RenderPass, Subpass}, swapchain::{Surface, Swapchain, SwapchainCreateInfo}
 };
 use winit::window::Window;
+
+pub const WORLD_ORIGIN: Vec2 = Vec2::new(21_720., 14_330.); // in km, relative to mapbox tile 0,0
 
 impl App {
     pub fn create_swapchain(&self, window: Arc<Window>) -> Result<(Arc<Swapchain>, Vec<Arc<Image>>)> {
@@ -208,5 +212,24 @@ impl App {
         };
         Ok(())
     }
+}
+
+/// Returns tile index in the format `(x, y, z)`
+pub fn world_to_tile_idx(pos: Vec3) -> UVec3 {
+    // TODO: Don't hardcode zoom level
+    (pos.as_uvec3() / 10).with_z(12)
+}
+
+/// Returns world coords in the format `(x, y, z)`
+pub fn tile_to_world_coords(pos: UVec3) -> Vec3 {
+    // TODO: Don't hardcode zoom level
+    (pos.as_vec3() * 10.).with_z(12.)
+}
+
+/// Calculates the side length of a patch given a zoom level
+pub fn zoom_to_dist(z: u8) -> f32 {
+    debug_assert!(z < 23, "Zoom level out of bounds");
+    const EARTH_CIRCUMFERENCE: f32 = 40_000.0; // in km, approximately
+    EARTH_CIRCUMFERENCE / (2_f32.powf(z.into()))
 }
 
