@@ -5,7 +5,7 @@ use lru::LruCache;
 
 use std::{num::NonZeroUsize, sync::Arc};
 use reqwest::blocking::Client;
-use image::{ImageBuffer, Luma, RgbaImage};
+use image::{DynamicImage, ImageBuffer, Luma, RgbaImage};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{AutoCommandBufferBuilder, BufferImageCopy, CommandBufferUsage, CopyBufferToImageInfo, allocator::StandardCommandBufferAllocator}, device::Queue, format::Format, image::{Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage, view::{ImageView, ImageViewCreateInfo, ImageViewType}}, memory::allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::graphics::vertex_input::Vertex, sync::GpuFuture
 };
@@ -28,7 +28,8 @@ pub struct Terrain {
     needs_rebuild: bool,
 
     // cpu resources
-    origin: Vec3,
+    origin: Vec2,
+    zoom: u32,
     heightmap_cache: LruCache<UVec3, (Gray16Image, RgbaImage)>,
     clipmap: Clipmap,
     prev_top_left: UVec3,
@@ -54,6 +55,7 @@ struct TerrainGpuResources {
 const HEIGHTMAP_SIZE: (usize, usize) = (256, 256);
 /// How many images the image array on the GPU can hold
 const IMAGE_BUFFER_SIZE: usize = 512;
+const USE_API: bool = false;
 
 impl Terrain {
     pub fn new(
@@ -62,15 +64,17 @@ impl Terrain {
         command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
         ) -> Result<Self> {
         let gpu_resources = TerrainGpuResources::new(memory_allocator, queue, command_buffer_allocator)?;
-        let origin = Vec3::new(21_720., 14_330., 12.);
+        let origin = Vec2::new(21_720., 14_330.);
+        let zoom = 12;
 
         let mut terrain = Terrain { 
             needs_rebuild: true,
 
             // CPU
             origin,
+            zoom,
             heightmap_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
-            clipmap: Clipmap::new(origin, 2),
+            clipmap: Clipmap::new(origin, 12, 2),
             prev_top_left: UVec3::ZERO,
 
             // GPU
@@ -92,14 +96,14 @@ impl Terrain {
         self.gpu_resources.instance_buffer.clone()
     }
     pub fn set_origin(&mut self, coords: Vec3) {
-
         let rings = self.clipmap.rings.len();
-        let top_left_tile = (util::world_to_tile_idx(coords) / (2_u32.pow(rings as u32)))
-            * 2_u32.pow(rings as u32);
+        let zoom = util::zoom_from_height(coords.z).min(MAX_ZOOM_TERRAIN);
+        let top_left_tile = Clipmap::find_starting_tile(coords.xy(), zoom, rings as u8);
 
         if self.prev_top_left != top_left_tile {
             self.prev_top_left = top_left_tile;
             self.origin = util::tile_to_world_coords(top_left_tile);
+            self.zoom = zoom;
             self.needs_rebuild = true;
         }
     }
@@ -108,7 +112,7 @@ impl Terrain {
     pub fn update(&mut self) -> Result<()> {
         if !self.needs_rebuild { return Ok(()) }
 
-        self.clipmap.rebuild(self.origin);
+        self.clipmap.rebuild(self.origin, self.zoom);
         self.load_heightmaps_cpu()
             .context("Failed to cache heightmaps")?;
 
@@ -116,12 +120,11 @@ impl Terrain {
         let mut heightmap_data: Vec<u16> = Vec::new();
         let mut color_data: Vec<u8> = Vec::new();
 
-        let zoom: u32 = self.origin.z as u32;
         const CLIPMAP_CENTER_RADIUS: u32 = 4;
         for (x, row) in self.clipmap.center.iter().enumerate() {
             for (y, coords) in row.iter().enumerate() {
-                let scale = util::zoom_to_dist(zoom as u8);
-                let offset = self.origin.xy() + Vec2::new(y as f32, x as f32) * scale - util::WORLD_ORIGIN;
+                let scale = util::zoom_to_dist(self.zoom);
+                let offset = self.origin + Vec2::new(y as f32, x as f32) * scale - util::WORLD_ORIGIN;
 
                 let layer_index = (x as u32 * CLIPMAP_CENTER_RADIUS + y as u32) as u32;
 
@@ -134,22 +137,22 @@ impl Terrain {
                 heightmap_data.append(
                     &mut self.heightmap_cache
                     .get_mut(coords)
-                    .context(format!("Tried to use uncached image at ({}, {}, {})", x, y, zoom))?
+                    .context(format!("Tried to use uncached image at ({}, {}, {})", x, y, self.zoom))?
                     .0
                     .as_raw().clone()
                     );
                 color_data.append(
                     &mut self.heightmap_cache
                     .get_mut(coords)
-                    .context(format!("Tried to use uncached image at ({}, {}, {})", x, y, zoom))?
+                    .context(format!("Tried to use uncached image at ({}, {}, {})", x, y, self.zoom))?
                     .1
                     .as_raw().clone()
                     );
             }
         }
-        let mut top_left_inner = self.origin.xy();
+        let mut top_left_inner = self.origin;
         for (r_idx, ring) in self.clipmap.rings.iter().enumerate() {
-                let scale = util::zoom_to_dist((zoom-(r_idx + 1) as u32) as u8);
+                let scale = util::zoom_to_dist(self.zoom-(r_idx + 1) as u32);
                 for (tile_idx, coords) in ring.iter().enumerate() {
                     let offset = Clipmap::map_ring_offset(tile_idx, top_left_inner, scale) - util::WORLD_ORIGIN;
 
@@ -222,12 +225,19 @@ impl Terrain {
 
             // load color
             // the api expects the ordering z, y, x for some reason
-            let url = format!("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/GoogleMapsCompatible/{}/{}/{}.jpg", z, y, x);
-            let resp = client.get(url).send()
-                .context("Failed to connect to EOX server")?;
-            let bytes = resp.bytes().context("Failed to read bytes")?;
-            let color: RgbaImage = image::load_from_memory(&bytes)
-                .context("Failed to decode image")?.to_rgba8();
+            let color: RgbaImage = match USE_API {
+                true => {
+                    let url = format!("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/GoogleMapsCompatible/{}/{}/{}.jpg", z, y, x);
+                    let resp = client.get(url).send()
+                        .context("Failed to connect to EOX server")?;
+                    let bytes = resp.bytes().context("Failed to read bytes")?;
+                    image::load_from_memory(&bytes)
+                        .context("Failed to decode image")?.to_rgba8()
+                },
+                false => {
+                    DynamicImage::ImageLuma16(heightmap.clone()).into_rgba8()
+                }
+            };
 
             self.heightmap_cache.put(UVec3::new(*x, *y, *z), (heightmap, color));
         }
@@ -378,9 +388,12 @@ struct Clipmap {
     rings: Vec<[UVec3; 12]>,
 }
 
+const MAX_ZOOM_TERRAIN: u32 = 12;
 impl Clipmap {
-    pub fn new(origin: Vec3, rings: u8) -> Self {
-        let mut top_left_tile = Self::find_starting_tile(origin, rings);
+    pub fn new(origin: Vec2, zoom: u32, rings: u8) -> Self {
+        let zoom = zoom.min(MAX_ZOOM_TERRAIN);
+        let mut top_left_tile = Self::find_starting_tile(origin, zoom, rings);
+        top_left_tile.z = top_left_tile.z.min(MAX_ZOOM_TERRAIN);
 
         let center = Self::make_center(top_left_tile);
 
@@ -396,9 +409,9 @@ impl Clipmap {
         }
     }
 
-    pub fn rebuild(&mut self, origin: Vec3) {
+    pub fn rebuild(&mut self, origin: Vec2, zoom: u32) {
         let rings = self.rings.len();
-        let new = Clipmap::new(origin, rings as u8);
+        let new = Clipmap::new(origin, zoom, rings as u8);
 
         *self = new;
     }
@@ -427,8 +440,9 @@ impl Clipmap {
 
     // The top left tile of the center (and each ring) must be bottom right of a tile with zoom level - 1
     // truncating division ensures the tile is a top-left subtile
-    fn find_starting_tile(pos: Vec3, rings: u8) -> UVec3 {
-        let mut start = util::world_to_tile_idx(pos);
+    fn find_starting_tile(pos: Vec2, zoom: u32, rings: u8) -> UVec3 {
+        let mut start = util::world_to_tile_idx(pos, zoom);
+
         let zoom = start.z;
         for _ in 0..rings {
             start /= 2;
@@ -545,7 +559,7 @@ mod tests {
 
     #[test]
     fn find_starting_tile_test() {
-        let actual = Clipmap::find_starting_tile(Vec3::new(21715., 14314., 12.), 2);
+        let actual = Clipmap::find_starting_tile(Vec2::new(21715., 14314.), 12, 2);
         let expected = UVec3::new(2170, 1430, 12);
 
         assert_eq!(actual, expected);
@@ -553,7 +567,7 @@ mod tests {
 
     #[test]
     fn clipmap_test() {
-        let cm = Clipmap::new(Vec3::new(21715., 14314., 12.), 2);
+        let cm = Clipmap::new(Vec2::new(21715., 14314.), 12, 2);
 
         let center = [
             [UVec3::new(2170, 1430, 12), UVec3::new(2171, 1430, 12), UVec3::new(2172, 1430, 12), UVec3::new(2173, 1430, 12)],

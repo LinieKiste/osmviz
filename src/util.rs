@@ -5,9 +5,7 @@ use crate::terrain::TileInstance;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 
-use glam::UVec3;
-use glam::Vec2;
-use glam::Vec3;
+use glam::{UVec3, Vec2, Vec3, Vec3Swizzles};
 use vulkano::Validated;
 use vulkano::VulkanError;
 use vulkano::command_buffer::AutoCommandBufferBuilder;
@@ -215,21 +213,32 @@ impl App {
 }
 
 /// Returns tile index in the format `(x, y, z)`
-pub fn world_to_tile_idx(pos: Vec3) -> UVec3 {
-    // TODO: Don't hardcode zoom level
-    (pos.as_uvec3() / 10).with_z(12)
+pub fn world_to_tile_idx(pos: Vec2, zoom: u32) -> UVec3 {
+    (pos / zoom_to_dist(zoom)).as_uvec2().extend(zoom)
 }
 
 /// Returns world coords in the format `(x, y, z)`
-pub fn tile_to_world_coords(pos: UVec3) -> Vec3 {
-    // TODO: Don't hardcode zoom level
-    (pos.as_vec3() * 10.).with_z(12.)
+pub fn tile_to_world_coords(pos: UVec3) -> Vec2 {
+    pos.as_vec3().xy() * zoom_to_dist(pos.z) 
 }
 
 /// Calculates the side length of a patch given a zoom level
-pub fn zoom_to_dist(z: u8) -> f32 {
-    debug_assert!(z < 23, "Zoom level out of bounds");
-    const EARTH_CIRCUMFERENCE: f32 = 40_000.0; // in km, approximately
-    EARTH_CIRCUMFERENCE / (2_f32.powf(z.into()))
+pub fn zoom_to_dist(z: u32) -> f32 {
+    debug_assert!(z < 23 && z > 4, "Zoom level out of bounds");
+    const EARTH_CIRCUMFERENCE: f32 = 40_960.0; // in km, approximately. Increased so tile length is 10 at zoom 12
+    EARTH_CIRCUMFERENCE / (2_f32.powf(z as f32))
+}
+
+pub fn zoom_from_height(height: f32) -> u32 {
+    (4. + 1800./(height+100.)).clamp(4., 18.) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_zoom_to_dist() {
+        assert_eq!(zoom_to_dist(12), 10.)
+    }
 }
 

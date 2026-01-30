@@ -80,7 +80,9 @@ impl Camera {
     }
 
     pub fn get_position(&self) -> Vec3 {
-        self.position.xzy().with_z(12.)
+        dbg!(self.position);
+        dbg!("zoom: {}", 4. + 1800./(self.position.y+100.));
+        self.position.xzy()
     }
 
     /// Update internal aspect ratio when window resizes

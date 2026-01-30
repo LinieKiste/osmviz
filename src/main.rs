@@ -2,6 +2,7 @@ mod camera;
 mod shaders;
 mod terrain;
 mod util;
+mod vector_tile;
 
 use std::sync::Arc;
 use anyhow::{Result, Context};
