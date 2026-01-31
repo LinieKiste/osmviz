@@ -15,8 +15,10 @@ pub struct CameraUniform {
     pub view: [[f32; 4]; 4],
     pub proj: [[f32; 4]; 4],
     pub position: [f32; 3], 
-    pub _padding: f32, // Essential for std140 alignment (vec3 is 16 bytes aligned)
+    pub _padding: f32,
 }
+
+const MAX_HEIGHT: f32 = 2500.;
 
 /// 1 unit is set as 1 kilometer
 /// We approximate a single zoom 12 tile to have a side length of 10km
@@ -59,7 +61,7 @@ impl Camera {
             aspect_ratio: width / height,
             fov: 45.0_f32.to_radians(),
             near: 0.1,
-            far: 2000.0,
+            far: 24000.0,
 
             speed: 5.0, // Meters per second
             rot_speed: 0.5,
@@ -80,8 +82,6 @@ impl Camera {
     }
 
     pub fn get_position(&self) -> Vec3 {
-        dbg!(self.position);
-        dbg!("zoom: {}", 4. + 1800./(self.position.y+100.));
         self.position.xzy()
     }
 
@@ -132,7 +132,7 @@ impl Camera {
         let right = Vec3::new(sin_y, 0.0, -cos_y).normalize();
         let up = Vec3::Y;
 
-        let velocity = self.speed * delta_time;
+        let velocity = self.speed * delta_time * (self.position.y/20.);
 
         if self.move_forward { self.position += forward * velocity; }
         if self.move_backward { self.position -= forward * velocity; }
@@ -150,6 +150,8 @@ impl Camera {
 
         if self.move_up { self.position += up * velocity; }
         if self.move_down { self.position -= up * velocity; }
+
+        self.position.y = self.position.y.min(MAX_HEIGHT);
     }
 
     /// Construct the matrices and uniform data

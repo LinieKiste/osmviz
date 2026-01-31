@@ -1,4 +1,4 @@
-use crate::{TerrainVertex, util};
+use crate::{TerrainVertex, util, vector_tile::{BuildingVertex, VectorTile}};
 use anyhow::{Result, Context};
 use glam::{UVec2, UVec3, Vec2, Vec3, Vec3Swizzles};
 use lru::LruCache;
@@ -10,7 +10,7 @@ use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{AutoCommandBufferBuilder, BufferImageCopy, CommandBufferUsage, CopyBufferToImageInfo, allocator::StandardCommandBufferAllocator}, device::Queue, format::Format, image::{Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage, view::{ImageView, ImageViewCreateInfo, ImageViewType}}, memory::allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::graphics::vertex_input::Vertex, sync::GpuFuture
 };
 
-type Gray16Image = ImageBuffer<Luma<u16>, Vec<u16>>;
+pub type Gray16Image = ImageBuffer<Luma<u16>, Vec<u16>>;
 
 #[derive(BufferContents, Vertex, Default)]
 #[repr(C)]
@@ -24,13 +24,14 @@ pub struct TileInstance {
     pub scale: f32,
 }
 
+type CacheEntry = (Gray16Image, RgbaImage, Option<VectorTile>);
 pub struct Terrain {
     needs_rebuild: bool,
 
     // cpu resources
     origin: Vec2,
     zoom: u32,
-    heightmap_cache: LruCache<UVec3, (Gray16Image, RgbaImage)>,
+    heightmap_cache: LruCache<UVec3, CacheEntry>,
     clipmap: Clipmap,
     prev_top_left: UVec3,
 
@@ -44,6 +45,7 @@ struct TerrainGpuResources {
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
 
     instance_buffer: Subbuffer<[TileInstance]>,
+    building_vertices: Subbuffer<[BuildingVertex]>,
 
     heightmap_array: Arc<Image>,
     heightmap_array_view: Arc<ImageView>,
@@ -55,7 +57,7 @@ struct TerrainGpuResources {
 const HEIGHTMAP_SIZE: (usize, usize) = (256, 256);
 /// How many images the image array on the GPU can hold
 const IMAGE_BUFFER_SIZE: usize = 512;
-const USE_API: bool = false;
+const USE_API: bool = true;
 
 impl Terrain {
     pub fn new(
@@ -74,7 +76,7 @@ impl Terrain {
             origin,
             zoom,
             heightmap_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
-            clipmap: Clipmap::new(origin, 12, 2),
+            clipmap: Clipmap::new(origin, 12, 1),
             prev_top_left: UVec3::ZERO,
 
             // GPU
@@ -84,6 +86,16 @@ impl Terrain {
         terrain.update()?;
 
         Ok(terrain)
+    }
+
+    pub fn get_building_vertices(&mut self) -> Subbuffer<[BuildingVertex]> {
+        // TODO: remove Create a simple debug quad hovering at Y=100
+        // let building_vertices = vec![
+        //     BuildingVertex { position: [00.0, 20.0, 0.0] },
+        //     BuildingVertex { position: [10.0, 20.0, 0.0] },
+        //     BuildingVertex { position: [00.0, 40.0, 0.0] }, // Just a triangle for now
+        // ];
+        self.gpu_resources.building_vertices.clone()
     }
 
     pub fn get_heightmaps(&self) -> Arc<ImageView> {
@@ -97,8 +109,9 @@ impl Terrain {
     }
     pub fn set_origin(&mut self, coords: Vec3) {
         let rings = self.clipmap.rings.len();
-        let zoom = util::zoom_from_height(coords.z).min(MAX_ZOOM_TERRAIN);
-        let top_left_tile = Clipmap::find_starting_tile(coords.xy(), zoom, rings as u8);
+        let zoom = util::zoom_from_height(coords.z);
+        let terrain_zoom = util::zoom_from_height(coords.z).min(MAX_ZOOM_TERRAIN);
+        let top_left_tile = Clipmap::find_starting_tile(coords.xy(), terrain_zoom, rings as u8);
 
         if self.prev_top_left != top_left_tile {
             self.prev_top_left = top_left_tile;
@@ -112,13 +125,14 @@ impl Terrain {
     pub fn update(&mut self) -> Result<()> {
         if !self.needs_rebuild { return Ok(()) }
 
-        self.clipmap.rebuild(self.origin, self.zoom);
+        self.clipmap.rebuild(self.origin, self.zoom.min(MAX_ZOOM_TERRAIN));
         self.load_heightmaps_cpu()
             .context("Failed to cache heightmaps")?;
 
         let mut instances = Vec::new();
         let mut heightmap_data: Vec<u16> = Vec::new();
         let mut color_data: Vec<u8> = Vec::new();
+        let mut building_vertices: Vec<BuildingVertex> = Vec::new();
 
         const CLIPMAP_CENTER_RADIUS: u32 = 4;
         for (x, row) in self.clipmap.center.iter().enumerate() {
@@ -134,20 +148,16 @@ impl Terrain {
                     scale,
                 });
 
-                heightmap_data.append(
-                    &mut self.heightmap_cache
+                let entry = self.heightmap_cache
                     .get_mut(coords)
-                    .context(format!("Tried to use uncached image at ({}, {}, {})", x, y, self.zoom))?
-                    .0
-                    .as_raw().clone()
-                    );
-                color_data.append(
-                    &mut self.heightmap_cache
-                    .get_mut(coords)
-                    .context(format!("Tried to use uncached image at ({}, {}, {})", x, y, self.zoom))?
-                    .1
-                    .as_raw().clone()
-                    );
+                    .context(format!("Tried to use uncached entry at ({}, {}, {})", x, y, self.zoom))?;
+
+                heightmap_data.append(&mut entry.0.as_raw().clone());
+                color_data.append(&mut entry.1.as_raw().clone());
+                if let Some(v) = &entry.2 {
+                    println!("We have vertices.");
+                    building_vertices.append(&mut v.clone().mesh);
+                }
             }
         }
         let mut top_left_inner = self.origin;
@@ -164,20 +174,15 @@ impl Terrain {
                         scale,
                     });
 
-                    heightmap_data.append(
-                        &mut self.heightmap_cache
+                    let entry = self.heightmap_cache
                         .get_mut(coords)
-                        .context(format!("Tried to use uncached image {}", coords))?
-                        .0
-                        .as_raw().clone()
-                    );
-                    color_data.append(
-                        &mut self.heightmap_cache
-                        .get_mut(coords)
-                        .context(format!("Tried to use uncached image {}", coords))?
-                        .1
-                        .as_raw().clone()
-                    );
+                        .context(format!("Tried to use uncached entry at {}", coords))?;
+
+                    heightmap_data.append(&mut entry.0.as_raw().clone());
+                    color_data.append(&mut entry.1.as_raw().clone());
+                    if let Some(v) = &entry.2 {
+                        building_vertices.append(&mut v.clone().mesh);
+                    }
                 }
                 top_left_inner -= Vec2::ONE*scale;
         }
@@ -187,6 +192,22 @@ impl Terrain {
             .context("Failed to upload heightmaps to GPU")?;
         self.gpu_resources.upload_image_array(color_data, layers as u32, self.gpu_resources.color_array.clone())
             .context("Failed to upload color maps to GPU")?;
+
+        dbg!(building_vertices.len());
+        if building_vertices.len() > 0 {
+            self.gpu_resources.building_vertices = Buffer::from_iter(
+                self.gpu_resources.memory_allocator.clone(),
+                BufferCreateInfo { 
+                    usage: BufferUsage::VERTEX_BUFFER, 
+                    ..Default::default() 
+                },
+                AllocationCreateInfo { 
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE, 
+                    ..Default::default() 
+                },
+                building_vertices,
+            )?.into();
+        }
 
         self.gpu_resources.instance_buffer = Buffer::from_iter(
             self.gpu_resources.memory_allocator.clone(),
@@ -199,7 +220,7 @@ impl Terrain {
                 ..Default::default() 
             },
             instances,
-        ).unwrap().into();
+        )?.into();
 
         self.needs_rebuild = false;
 
@@ -207,12 +228,12 @@ impl Terrain {
     }
 
     fn load_heightmaps_cpu(&mut self) -> Result<()> {
-        let client = Client::new();
+        let client = &Client::new();
 
         eprintln!("Fetching tiles");
         for UVec3 { x, y, z } in self.clipmap.center.iter().flatten()
             .chain(self.clipmap.rings.iter().flatten()) {
-            if self.heightmap_cache.get(&UVec3::new(*x, *y, *z)) != None { continue; } // skips if already loaded, but marks as recently used
+            if self.heightmap_cache.get(&UVec3::new(*x, *y, *z)).is_some() { continue; } // skips if already loaded, but marks as recently used
 
             // load heightmap
             let url = format!("http://localhost:3000/terrain/{}/{}/{}", z, x, y);
@@ -221,7 +242,8 @@ impl Terrain {
                 .context("Failed to connect to Tileserver")?;
             let bytes = resp.bytes().context("Failed to read bytes")?;
             let heightmap: Gray16Image = image::load_from_memory(&bytes)
-                .context("Failed to decode image")?.to_luma16();
+                .unwrap_or( DynamicImage::new_luma16(HEIGHTMAP_SIZE.0 as u32, HEIGHTMAP_SIZE.1 as u32))
+                .to_luma16();
 
             // load color
             // the api expects the ordering z, y, x for some reason
@@ -239,7 +261,11 @@ impl Terrain {
                 }
             };
 
-            self.heightmap_cache.put(UVec3::new(*x, *y, *z), (heightmap, color));
+            // load vector tile
+            let tile = VectorTile::new(client, UVec3::new(*x,*y,*z), &heightmap)
+                .ok();
+
+            self.heightmap_cache.put(UVec3::new(*x, *y, *z), (heightmap, color, tile));
         }
 
         Ok(())
@@ -313,6 +339,19 @@ impl TerrainGpuResources {
             },
             128
         ).unwrap().into();
+        // Garbage init
+        let building_vertex_buffer = Buffer::new_slice(
+            memory_allocator.clone(),
+            BufferCreateInfo { 
+                usage: BufferUsage::VERTEX_BUFFER, 
+                ..Default::default() 
+            },
+            AllocationCreateInfo { 
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE, 
+                ..Default::default() 
+            },
+            1
+        ).unwrap().into();
 
 
         Ok(TerrainGpuResources {
@@ -326,6 +365,7 @@ impl TerrainGpuResources {
             heightmap_array_view,
             color_array,
             color_array_view,
+            building_vertices: building_vertex_buffer,
         })
     }
 
@@ -391,9 +431,7 @@ struct Clipmap {
 const MAX_ZOOM_TERRAIN: u32 = 12;
 impl Clipmap {
     pub fn new(origin: Vec2, zoom: u32, rings: u8) -> Self {
-        let zoom = zoom.min(MAX_ZOOM_TERRAIN);
         let mut top_left_tile = Self::find_starting_tile(origin, zoom, rings);
-        top_left_tile.z = top_left_tile.z.min(MAX_ZOOM_TERRAIN);
 
         let center = Self::make_center(top_left_tile);
 

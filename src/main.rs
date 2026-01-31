@@ -6,6 +6,7 @@ mod vector_tile;
 
 use std::sync::Arc;
 use anyhow::{Result, Context};
+use glam::UVec3;
 use vulkano::{
     VulkanLibrary, buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer, allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo}}, command_buffer::allocator::StandardCommandBufferAllocator, descriptor_set::{
         DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator
@@ -23,7 +24,7 @@ use winit::{
     application::ApplicationHandler, event::{KeyEvent, WindowEvent}, event_loop::{ActiveEventLoop, EventLoop}, keyboard::{KeyCode, PhysicalKey}, window::{Window, WindowId}
 };
 
-use crate::{camera::Camera, terrain::Terrain};
+use crate::{camera::Camera, terrain::Terrain, vector_tile::BuildingVertex};
 
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
@@ -33,6 +34,12 @@ pub struct TerrainVertex {
 }
 
 fn main() -> Result<()> {
+    // let client = reqwest::blocking::Client::new();
+    // let coords = UVec3::new(8718, 5685, 14);
+    // let tile = vector_tile::VectorTile::new(client, coords)?;
+
+    // Ok(())
+
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(&event_loop)?;
 
@@ -58,7 +65,8 @@ struct RenderContext {
     swapchain: Arc<Swapchain>,
     render_pass: Arc<RenderPass>,
     framebuffers: Vec<Arc<Framebuffer>>,
-    pipeline: Arc<GraphicsPipeline>,
+    terrain_pipeline: Arc<GraphicsPipeline>,
+    building_pipeline: Arc<GraphicsPipeline>,
     viewport: Viewport,
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
@@ -171,7 +179,8 @@ impl App {
         )?;
 
         // load texture
-        let terrain = Terrain::new(memory_allocator.clone(), queue.clone(), command_buffer_allocator.clone())?;
+        let mut terrain = Terrain::new(memory_allocator.clone(), queue.clone(), command_buffer_allocator.clone())?;
+
 
         Ok(App {
             instance,
@@ -223,8 +232,10 @@ impl ApplicationHandler for App {
 
         let framebuffers = window_size_dependent_setup(&images, &render_pass, &self.memory_allocator);
 
-        let pipeline = self.create_tessellation_pipeline(&render_pass)
+        let terrain_pipeline = self.create_tessellation_pipeline(&render_pass)
             .expect("failed to create tessellation pipeline");
+        let building_pipeline = self.create_building_pipeline(&render_pass)
+            .expect("failed to create building pipeline");
 
         let viewport = Viewport {
             offset: [0.0, 0.0],
@@ -241,7 +252,8 @@ impl ApplicationHandler for App {
             swapchain,
             render_pass,
             framebuffers,
-            pipeline,
+            terrain_pipeline,
+            building_pipeline,
             viewport,
             recreate_swapchain: false,
             previous_frame_end,
@@ -318,12 +330,12 @@ impl ApplicationHandler for App {
                 },
                 ).unwrap();
 
-                let layout = &rcx.pipeline.layout().set_layouts()[0];
-                let descriptor_set_camera = DescriptorSet::new(
+                let layout = &rcx.terrain_pipeline.layout().set_layouts()[0];
+                let descriptor_set_terrain = DescriptorSet::new(
                     self.descriptor_set_allocator.clone(),
                     layout.clone(),
                     [
-                    WriteDescriptorSet::buffer(0, camera_ubo),
+                    WriteDescriptorSet::buffer(0, camera_ubo.clone()),
                     WriteDescriptorSet::image_view_sampler(1, self.terrain.get_heightmaps(), sampler.clone()),
                     WriteDescriptorSet::image_view_sampler(2, self.terrain.get_colormaps(), sampler),
                     ],
@@ -331,7 +343,18 @@ impl ApplicationHandler for App {
                 )
                 .unwrap();
 
-                self.render(descriptor_set_camera).expect("Rendering failed!");
+                let building_layout = &rcx.building_pipeline.layout().set_layouts()[0];
+                let descriptor_set_building = DescriptorSet::new(
+                    self.descriptor_set_allocator.clone(),
+                    building_layout.clone(),
+                    [
+                    // We only provide binding 0 (Camera), reusing the same buffer!
+                    WriteDescriptorSet::buffer(0, camera_ubo), 
+                    ],
+                    [],
+                ).unwrap();
+
+                self.render(&[descriptor_set_terrain, descriptor_set_building]).expect("Rendering failed!");
             }
             _ => {}
         }
@@ -341,13 +364,6 @@ impl ApplicationHandler for App {
         let rcx = self.rcx.as_mut().unwrap();
         rcx.window.request_redraw();
     }
-}
-
-#[derive(BufferContents, Vertex)]
-#[repr(C)]
-struct MyVertex {
-    #[format(R32G32_SFLOAT)]
-    position: [f32; 2],
 }
 
 /// This function is called once during initialization, then again whenever the window is resized.

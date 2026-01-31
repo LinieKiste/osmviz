@@ -1,3 +1,4 @@
+use crate::vector_tile::BuildingVertex;
 use crate::App;
 use crate::TerrainVertex;
 use crate::shaders::*;
@@ -12,19 +13,17 @@ use vulkano::command_buffer::AutoCommandBufferBuilder;
 use vulkano::command_buffer::CommandBufferUsage;
 use vulkano::command_buffer::RenderPassBeginInfo;
 use vulkano::descriptor_set::DescriptorSet;
-use vulkano::pipeline::Pipeline;
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::pipeline::graphics::depth_stencil::DepthState;
-use vulkano::pipeline::graphics::depth_stencil::DepthStencilState;
-use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::swapchain::SwapchainPresentInfo;
 use vulkano::swapchain::acquire_next_image;
 use vulkano::{
     image::{Image, ImageUsage},
     sync::{self, GpuFuture},
     pipeline::{
-        DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo, graphics::{
-            GraphicsPipelineCreateInfo, color_blend::{ColorBlendAttachmentState, ColorBlendState}, input_assembly::{InputAssemblyState, PrimitiveTopology}, multisample::MultisampleState, rasterization::{PolygonMode, RasterizationState}, tessellation::TessellationState, vertex_input::{Vertex, VertexDefinition}, viewport::ViewportState
+        Pipeline, PipelineBindPoint,
+        DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+        graphics::{
+            depth_stencil::{DepthState, DepthStencilState},
+            GraphicsPipelineCreateInfo, color_blend::{ColorBlendAttachmentState, ColorBlendState}, input_assembly::{InputAssemblyState, PrimitiveTopology}, multisample::MultisampleState, rasterization::{PolygonMode, RasterizationState, CullMode}, tessellation::TessellationState, vertex_input::{Vertex, VertexDefinition}, viewport::ViewportState
         }, layout::PipelineDescriptorSetLayoutCreateInfo
     }, render_pass::{RenderPass, Subpass}, swapchain::{Surface, Swapchain, SwapchainCreateInfo}
 };
@@ -131,7 +130,60 @@ impl App {
                 )?)
     }
 
-    pub fn render(&mut self, descriptor_sets: Arc<DescriptorSet>) -> Result<()> {
+    pub fn create_building_pipeline(&self, render_pass: &Arc<RenderPass>) -> Result<Arc<GraphicsPipeline>> {
+        let vs = building_vs::load(self.device.clone())?.entry_point("main").unwrap();
+        let fs = building_fs::load(self.device.clone())?.entry_point("main").unwrap();
+
+        let vertex_input_state = BuildingVertex::per_vertex()
+            .definition(&vs)?;
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let layout = PipelineLayout::new(
+            self.device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(self.device.clone())?
+        )?;
+
+        let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+
+        Ok(GraphicsPipeline::new(
+            self.device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList, // Standard triangles
+                    ..Default::default()
+                }),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState {
+                    polygon_mode: PolygonMode::Fill,
+                    cull_mode: CullMode::None, // Cull back-faces
+                    front_face: vulkano::pipeline::graphics::rasterization::FrontFace::CounterClockwise,
+                    ..Default::default()
+                }),
+                depth_stencil_state: Some(DepthStencilState {
+                    depth: Some(DepthState::simple()), // Read/Write depth buffer
+                    ..Default::default()
+                }),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    subpass.num_color_attachments(),
+                    ColorBlendAttachmentState::default(),
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(subpass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )?)
+    }
+
+    pub fn render(&mut self, descriptor_sets: &[Arc<DescriptorSet>]) -> Result<()> {
         let rcx = self.rcx.as_mut().unwrap();
 
         let (image_index, suboptimal, acquire_future) = match acquire_next_image(
@@ -159,6 +211,9 @@ impl App {
         )?;
 
         let instance_buffer = self.terrain.get_instance_buffer();
+        let building_vertex_buffer = self.terrain.get_building_vertices();
+
+        // draw terrain
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -173,10 +228,17 @@ impl App {
                 Default::default(),
             )?
             .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())?
-            .bind_pipeline_graphics(rcx.pipeline.clone())?
-            .bind_descriptor_sets(PipelineBindPoint::Graphics, rcx.pipeline.layout().clone(), 0, descriptor_sets)?
+            .bind_pipeline_graphics(rcx.terrain_pipeline.clone())?
+            .bind_descriptor_sets(PipelineBindPoint::Graphics, rcx.terrain_pipeline.layout().clone(), 0, descriptor_sets[0].clone())?
             .bind_vertex_buffers(0, (self.vertex_buffer.clone(), instance_buffer.clone()))?;
         unsafe { builder.draw(self.vertex_buffer.len() as u32, instance_buffer.len() as u32, 0, 0) }?;
+
+        // draw buildings
+        builder
+            .bind_pipeline_graphics(rcx.building_pipeline.clone())?
+            .bind_descriptor_sets(PipelineBindPoint::Graphics, rcx.building_pipeline.layout().clone(), 0, descriptor_sets[1].clone())? // Re-use camera set (set 0)
+            .bind_vertex_buffers(0, building_vertex_buffer.clone())?;
+        unsafe { builder.draw(building_vertex_buffer.len() as u32, 1, 0, 0) }?;
 
         builder.end_render_pass(Default::default())?;
 
@@ -224,13 +286,13 @@ pub fn tile_to_world_coords(pos: UVec3) -> Vec2 {
 
 /// Calculates the side length of a patch given a zoom level
 pub fn zoom_to_dist(z: u32) -> f32 {
-    debug_assert!(z < 23 && z > 4, "Zoom level out of bounds");
+    debug_assert!(z < 23 && z >= 2, "Zoom level {} is out of bounds", z);
     const EARTH_CIRCUMFERENCE: f32 = 40_960.0; // in km, approximately. Increased so tile length is 10 at zoom 12
     EARTH_CIRCUMFERENCE / (2_f32.powf(z as f32))
 }
 
 pub fn zoom_from_height(height: f32) -> u32 {
-    (4. + 1800./(height+100.)).clamp(4., 18.) as u32
+    (5. + 3000./(height+400.)).clamp(4., 18.) as u32
 }
 
 #[cfg(test)]
