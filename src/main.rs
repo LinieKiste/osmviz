@@ -6,7 +6,7 @@ mod vector_tile;
 
 use std::sync::Arc;
 use anyhow::{Result, Context};
-use glam::UVec3;
+use egui_winit_vulkano::{Gui, GuiConfig};
 use vulkano::{
     VulkanLibrary, buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer, allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo}}, command_buffer::allocator::StandardCommandBufferAllocator, descriptor_set::{
         DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator
@@ -21,10 +21,10 @@ use vulkano::{
     }, sync::{self, GpuFuture}
 };
 use winit::{
-    application::ApplicationHandler, event::{KeyEvent, WindowEvent}, event_loop::{ActiveEventLoop, EventLoop}, keyboard::{KeyCode, PhysicalKey}, window::{Window, WindowId}
+    application::ApplicationHandler, dpi::LogicalSize, event::{KeyEvent, WindowEvent}, event_loop::{ActiveEventLoop, EventLoop}, keyboard::{KeyCode, PhysicalKey}, window::{Window, WindowId}
 };
 
-use crate::{camera::Camera, terrain::Terrain, vector_tile::BuildingVertex};
+use crate::{camera::Camera, terrain::Terrain};
 
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
@@ -34,11 +34,8 @@ pub struct TerrainVertex {
 }
 
 fn main() -> Result<()> {
-    // let client = reqwest::blocking::Client::new();
-    // let coords = UVec3::new(8718, 5685, 14);
-    // let tile = vector_tile::VectorTile::new(client, coords)?;
-
-    // Ok(())
+    unsafe {std::env::set_var("RUST_LOG", "info")}
+    env_logger::init();
 
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(&event_loop)?;
@@ -61,6 +58,8 @@ struct App {
 }
 
 struct RenderContext {
+    timestamp: std::time::Instant,
+    gui: Gui,
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
     render_pass: Arc<RenderPass>,
@@ -178,9 +177,7 @@ impl App {
             vertices,
         )?;
 
-        // load texture
-        let mut terrain = Terrain::new(memory_allocator.clone(), queue.clone(), command_buffer_allocator.clone())?;
-
+        let terrain = Terrain::new(memory_allocator.clone(), queue.clone(), command_buffer_allocator.clone())?;
 
         Ok(App {
             instance,
@@ -201,7 +198,11 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("osmviz")).unwrap(),
+            .create_window(
+                Window::default_attributes()
+                .with_title("osmviz")
+                .with_inner_size(LogicalSize::new(1920.0, 1080.0))
+            ).unwrap(),
         );
         let window_size = window.inner_size();
 
@@ -231,6 +232,16 @@ impl ApplicationHandler for App {
         ).unwrap();
 
         let framebuffers = window_size_dependent_setup(&images, &render_pass, &self.memory_allocator);
+        let gui = Gui::new(
+            event_loop,
+            swapchain.surface().clone(),
+            self.queue.clone(),
+            swapchain.image_format(),
+            GuiConfig {
+                is_overlay: true,
+                ..GuiConfig::default()
+            }
+        );
 
         let terrain_pipeline = self.create_tessellation_pipeline(&render_pass)
             .expect("failed to create tessellation pipeline");
@@ -248,6 +259,8 @@ impl ApplicationHandler for App {
         let camera = Camera::new(1920., 1080.);
 
         self.rcx = Some(RenderContext {
+            timestamp: std::time::Instant::now(),
+            gui,
             window,
             swapchain,
             render_pass,
@@ -269,6 +282,7 @@ impl ApplicationHandler for App {
     ) {
         let rcx = self.rcx.as_mut().unwrap();
 
+        rcx.gui.update(&event);
         rcx.camera.handle_input(&event);
         match event {
             WindowEvent::CloseRequested |
@@ -283,6 +297,9 @@ impl ApplicationHandler for App {
                 rcx.recreate_swapchain = true;
             }
             WindowEvent::RedrawRequested => {
+                let delta_time = rcx.timestamp.elapsed().as_secs_f64();
+                rcx.timestamp = std::time::Instant::now();
+
                 let window_size = rcx.window.inner_size();
 
                 if window_size.width == 0 || window_size.height == 0 {
@@ -307,7 +324,7 @@ impl ApplicationHandler for App {
                     rcx.recreate_swapchain = false;
                 }
 
-                rcx.camera.update(0.016);
+                rcx.camera.update(delta_time);
 
                 self.terrain.set_origin(rcx.camera.get_position());
                 self.terrain.update()
@@ -354,7 +371,7 @@ impl ApplicationHandler for App {
                     [],
                 ).unwrap();
 
-                self.render(&[descriptor_set_terrain, descriptor_set_building]).expect("Rendering failed!");
+                self.render(&[descriptor_set_terrain, descriptor_set_building], delta_time).expect("Rendering failed!");
             }
             _ => {}
         }

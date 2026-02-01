@@ -6,7 +6,8 @@ use crate::terrain::TileInstance;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 
-use glam::{UVec3, Vec2, Vec3, Vec3Swizzles};
+use glam::DVec2;
+use glam::{UVec3, Vec2, Vec3Swizzles};
 use vulkano::Validated;
 use vulkano::VulkanError;
 use vulkano::command_buffer::AutoCommandBufferBuilder;
@@ -29,7 +30,7 @@ use vulkano::{
 };
 use winit::window::Window;
 
-pub const WORLD_ORIGIN: Vec2 = Vec2::new(21_720., 14_330.); // in km, relative to mapbox tile 0,0
+pub const WORLD_ORIGIN: DVec2 = DVec2::new(21_720., 14_330.); // in km, relative to mapbox tile 0,0
 
 impl App {
     pub fn create_swapchain(&self, window: Arc<Window>) -> Result<(Arc<Swapchain>, Vec<Arc<Image>>)> {
@@ -183,7 +184,7 @@ impl App {
         )?)
     }
 
-    pub fn render(&mut self, descriptor_sets: &[Arc<DescriptorSet>]) -> Result<()> {
+    pub fn render(&mut self, descriptor_sets: &[Arc<DescriptorSet>], delta_time: f64) -> Result<()> {
         let rcx = self.rcx.as_mut().unwrap();
 
         let (image_index, suboptimal, acquire_future) = match acquire_next_image(
@@ -240,22 +241,45 @@ impl App {
             .bind_vertex_buffers(0, building_vertex_buffer.clone())?;
         unsafe { builder.draw(building_vertex_buffer.len() as u32, 1, 0, 0) }?;
 
+        // draw gui
+        rcx.gui.immediate_ui(|gui| {
+            let ctx = gui.context();
+
+            egui::Window::new("Debug Info").show(&ctx, |ui| {
+                ui.label(format!("FPS: {}", (1.0/delta_time) as u32));
+                ui.label(format!("Position: {}", rcx.camera.get_position().as_uvec3()));
+                ui.label(format!("Current center tile: {}", self.terrain.get_origin()));
+                if ui.button("Toggle color").clicked() {
+                    self.terrain.toggle_api();
+                }
+                ui.horizontal_top(
+                    |ui| {
+                        ui.label("Camera speed");
+                        ui.add(egui::Slider::new(&mut rcx.camera.speed, 0.0..=50.0));
+                });
+            });
+        });
+
         builder.end_render_pass(Default::default())?;
 
         let command_buffer = builder.build()?;
-        let future = rcx
+        let after_main_render = rcx
             .previous_frame_end
             .take().context("previous frame did not end")?
             .join(acquire_future)
-            .then_execute(self.queue.clone(), command_buffer)?
-            .then_swapchain_present(
-                self.queue.clone(),
-                SwapchainPresentInfo::swapchain_image_index(
-                    rcx.swapchain.clone(),
-                    image_index,
-                ),
-            )
-            .then_signal_fence_and_flush();
+            .then_execute(self.queue.clone(), command_buffer)?;
+
+        let after_gui_future = rcx.gui.draw_on_image(after_main_render, rcx.framebuffers[image_index as usize].attachments()[0].clone());
+
+        let future = after_gui_future
+        .then_swapchain_present(
+            self.queue.clone(),
+            SwapchainPresentInfo::swapchain_image_index(
+                rcx.swapchain.clone(),
+                image_index,
+            ),
+        )
+        .then_signal_fence_and_flush();
 
         match future.map_err(Validated::unwrap) {
             Ok(future) => {
@@ -275,23 +299,23 @@ impl App {
 }
 
 /// Returns tile index in the format `(x, y, z)`
-pub fn world_to_tile_idx(pos: Vec2, zoom: u32) -> UVec3 {
+pub fn world_to_tile_idx(pos: DVec2, zoom: u32) -> UVec3 {
     (pos / zoom_to_dist(zoom)).as_uvec2().extend(zoom)
 }
 
 /// Returns world coords in the format `(x, y, z)`
-pub fn tile_to_world_coords(pos: UVec3) -> Vec2 {
-    pos.as_vec3().xy() * zoom_to_dist(pos.z) 
+pub fn tile_to_world_coords(pos: UVec3) -> DVec2 {
+    pos.as_dvec3().xy() * zoom_to_dist(pos.z) 
 }
 
 /// Calculates the side length of a patch given a zoom level
-pub fn zoom_to_dist(z: u32) -> f32 {
-    debug_assert!(z < 23 && z >= 2, "Zoom level {} is out of bounds", z);
-    const EARTH_CIRCUMFERENCE: f32 = 40_960.0; // in km, approximately. Increased so tile length is 10 at zoom 12
-    EARTH_CIRCUMFERENCE / (2_f32.powf(z as f32))
+pub fn zoom_to_dist(z: u32) -> f64 {
+    debug_assert!((2..23).contains(&z), "Zoom level {} is out of bounds", z);
+    const EARTH_CIRCUMFERENCE: f64 = 40_960.0; // in km, approximately. Increased so tile length is 10 at zoom 12
+    EARTH_CIRCUMFERENCE / (2_f64.powf(z as f64))
 }
 
-pub fn zoom_from_height(height: f32) -> u32 {
+pub fn zoom_from_height(height: f64) -> u32 {
     (5. + 3000./(height+400.)).clamp(4., 18.) as u32
 }
 

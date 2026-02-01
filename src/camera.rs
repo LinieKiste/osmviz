@@ -1,8 +1,8 @@
 use crate::util;
 
-use glam::{Mat4, UVec3, Vec2, Vec3, Vec3Swizzles, Vec2Swizzles};
-use std::f32::consts::PI;
-use vulkano::buffer::{BufferContents, Subbuffer};
+use glam::{DVec3, Mat4, Vec2Swizzles, Vec3, Vec3Swizzles};
+use std::f64::consts::PI;
+use vulkano::buffer::BufferContents;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -18,15 +18,15 @@ pub struct CameraUniform {
     pub _padding: f32,
 }
 
-const MAX_HEIGHT: f32 = 2500.;
+const MAX_HEIGHT: f64 = 2500.;
 
 /// 1 unit is set as 1 kilometer
 /// We approximate a single zoom 12 tile to have a side length of 10km
 pub struct Camera {
     // Spatial properties
-    pub position: Vec3,
-    pub yaw: f32,   // Horizontal angle (radians)
-    pub pitch: f32, // Vertical angle (radians)
+    pub position: DVec3,
+    pub yaw: f64,   // Horizontal angle (radians)
+    pub pitch: f64, // Vertical angle (radians)
 
     // Lens properties
     pub aspect_ratio: f32,
@@ -35,9 +35,8 @@ pub struct Camera {
     pub far: f32,
 
     // Movement state (for smooth input handling)
-    speed: f32,
-    rot_speed: f32,
-    sensitivity: f32,
+    pub speed: f64,
+    rot_speed: f64,
     move_forward: bool,
     move_backward: bool,
     move_left: bool,
@@ -54,7 +53,7 @@ pub struct Camera {
 impl Camera {
     pub fn new(width: f32, height: f32) -> Self {
         Self {
-            position: Vec3::new(21_720., 10., 14_330.), 
+            position: DVec3::new(21_720., 10., 14_330.), 
             yaw: -PI / 2.0, // Look along -Z
             pitch: -PI / 4.0, // Look down 45 degrees
             
@@ -63,9 +62,8 @@ impl Camera {
             near: 0.1,
             far: 24000.0,
 
-            speed: 5.0, // Meters per second
-            rot_speed: 0.5,
-            sensitivity: 0.002,
+            speed: 20.0,
+            rot_speed: 2.0,
             
             move_forward: false,
             move_backward: false,
@@ -81,7 +79,7 @@ impl Camera {
         }
     }
 
-    pub fn get_position(&self) -> Vec3 {
+    pub fn get_position(&self) -> DVec3 {
         self.position.xzy()
     }
 
@@ -125,12 +123,12 @@ impl Camera {
     }
 
     /// Update Position based on time delta
-    pub fn update(&mut self, delta_time: f32) {
+    pub fn update(&mut self, delta_time: f64) {
         // Calculate forward/right vectors based on yaw
         let (sin_y, cos_y) = self.yaw.sin_cos();
-        let forward = Vec3::new(cos_y, 0.0, sin_y).normalize();
-        let right = Vec3::new(sin_y, 0.0, -cos_y).normalize();
-        let up = Vec3::Y;
+        let forward = DVec3::new(cos_y, 0.0, sin_y).normalize();
+        let right = DVec3::new(sin_y, 0.0, -cos_y).normalize();
+        let up = DVec3::Y;
 
         let velocity = self.speed * delta_time * (self.position.y/20.);
 
@@ -156,18 +154,18 @@ impl Camera {
 
     /// Construct the matrices and uniform data
     pub fn get_uniform_data(&self) -> CameraUniform {
-        let position = self.position - util::WORLD_ORIGIN.xxy().with_y(0.);
+        let position = (self.position - util::WORLD_ORIGIN.xxy().with_y(0.)).as_vec3();
 
         // 1. View Matrix (LookAt)
         // Standard FPS camera math
         let (sin_p, cos_p) = self.pitch.sin_cos();
         let (sin_y, cos_y) = self.yaw.sin_cos();
 
-        let direction = Vec3::new(
+        let direction = DVec3::new(
             cos_y * cos_p,
             sin_p,
             sin_y * cos_p
-        ).normalize();
+        ).as_vec3().normalize();
 
         let view = Mat4::look_at_rh(position, position + direction, Vec3::Y);
 
@@ -184,32 +182,6 @@ impl Camera {
             position: position.to_array(),
             _padding: 0.0,
         }
-    }
-
-    /// Returns the world coordinate where the camera is looking at the ground (Y=0).
-    /// Returns None if looking at the sky or horizon.
-    pub fn intersect_ground(&self) -> Option<Vec3> {
-        // 1. Reconstruct Forward Vector from Yaw/Pitch
-        // (Same math used in get_uniform_data)
-        let (sin_p, cos_p) = self.pitch.sin_cos();
-        let (sin_y, cos_y) = self.yaw.sin_cos();
-
-        let forward = Vec3::new(
-            cos_y * cos_p,
-            sin_p,
-            sin_y * cos_p
-        ).normalize();
-
-        // 2. Check if looking up or parallel (Y must be negative to hit ground)
-        if forward.y >= -0.0001 {
-            return None;
-        }
-
-        // 3. Ray-Plane Intersection (t = -Origin.y / Dir.y)
-        let t = -self.position.y / forward.y;
-
-        // 4. Calculate Hit Point
-        Some(self.position + forward * t)
     }
 }
 
