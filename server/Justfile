@@ -1,0 +1,40 @@
+# List available recipes by default
+default:
+    @just --list
+
+# Regenerate vector tiles using tilemaker
+tile:
+    docker run -it --rm --pull always -v $(pwd):/data -w /data \
+        ghcr.io/systemed/tilemaker:master \
+        /data/germany-latest.osm.pbf \
+        --output /data/germany_buildings.pmtiles \
+        --config /data/config.json \
+        --process /data/process.lua
+
+serve:
+    # 1. Create new window named 'tileservers'
+    tmux new-window -n tileservers
+    
+    # 2. Split horizontal to create the Right pane (Interactive)
+    tmux split-window -h -t tileservers
+    
+    # 3. Select Left pane (0) and split it vertical
+    tmux select-pane -t tileservers.0
+    tmux split-window -v -t tileservers.0
+    
+    # 4. Send commands
+    # Top Left (Pane 0) -> Martin
+    tmux send-keys -t tileservers.0 'martin -c martin_config.yaml' C-m
+    
+    # Bottom Left -> Uvicorn
+    # We select Pane 0, move Down to find the correct split, then send keys
+    tmux select-pane -t tileservers.0
+    tmux select-pane -D 
+    tmux send-keys 'source .venv/bin/activate && uvicorn main:app --reload' C-m
+    
+    # 5. Focus on the Right pane (Interactive) for your use
+    tmux select-pane -t tileservers.0
+    tmux select-pane -R
+
+stop:
+    tmux kill-window -t tileservers
