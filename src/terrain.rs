@@ -1,12 +1,12 @@
 use rayon::prelude::*;
-use crate::{TerrainVertex, util, vector_tile::{BuildingVertex, VectorTile}};
+use crate::{TerrainVertex, util, vector_tile::{BuildingVertex, TreeInstance, VectorTile}};
 use anyhow::{Result, Context};
 use glam::{DVec2, DVec3, UVec3, Vec3Swizzles};
 use lru::LruCache;
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{fmt::format, num::NonZeroUsize, sync::Arc};
 use reqwest::blocking::Client;
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, ImageReader, RgbaImage};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{AutoCommandBufferBuilder, BufferImageCopy, CommandBufferUsage, CopyBufferToImageInfo, allocator::StandardCommandBufferAllocator}, device::Queue, format::Format, image::{Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage, view::{ImageView, ImageViewCreateInfo, ImageViewType}}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::graphics::vertex_input::Vertex, sync::GpuFuture
 };
@@ -46,11 +46,13 @@ struct TerrainGpuResources {
 
     instance_buffer: Subbuffer<[TileInstance]>,
     building_vertices: Subbuffer<[BuildingVertex]>,
+    tree_instances: Subbuffer<[TreeInstance]>,
 
     heightmap_array: Arc<Image>,
     heightmap_array_view: Arc<ImageView>,
     color_array: Arc<Image>,
     color_array_view: Arc<ImageView>,
+    static_texture_views: Vec<Arc<ImageView>>,
 }
 
 /// Resolution of a single heightmap image, retrieved from the server
@@ -89,13 +91,10 @@ impl Terrain {
     }
 
     pub fn get_building_vertices(&mut self) -> Subbuffer<[BuildingVertex]> {
-        // TODO: remove Create a simple debug quad hovering at Y=100
-        // let building_vertices = vec![
-        //     BuildingVertex { position: [00.0, 20.0, 0.0] },
-        //     BuildingVertex { position: [10.0, 20.0, 0.0] },
-        //     BuildingVertex { position: [00.0, 40.0, 0.0] }, // Just a triangle for now
-        // ];
         self.gpu_resources.building_vertices.clone()
+    }
+    pub fn get_tree_instances(&mut self) -> Subbuffer<[TreeInstance]> {
+        self.gpu_resources.tree_instances.clone()
     }
 
     pub fn get_heightmaps(&self) -> Arc<ImageView> {
@@ -103,6 +102,9 @@ impl Terrain {
     }
     pub fn get_colormaps(&self) -> Arc<ImageView> {
         self.gpu_resources.color_array_view.clone()
+    }
+    pub fn get_tree_textures(&self) -> Vec<Arc<ImageView>> {
+        self.gpu_resources.static_texture_views.clone()
     }
     pub fn get_instance_buffer(&self) -> Subbuffer<[TileInstance]> {
         self.gpu_resources.instance_buffer.clone()
@@ -127,7 +129,6 @@ impl Terrain {
         self.use_api = !self.use_api;
         self.heightmap_cache.clear();
         self.needs_rebuild = true;
-        println!("api: {}", self.use_api)
     }
 
     /// Update heightmap array and instance buffer
@@ -142,7 +143,9 @@ impl Terrain {
         let mut heightmap_data: Vec<u8> = Vec::new();
         let mut color_data: Vec<u8> = Vec::new();
         let mut building_vertices: Vec<BuildingVertex> = Vec::new();
+        let mut tree_instances: Vec<TreeInstance> = Vec::new();
 
+        // ITERATE CLIPMAP CENTER
         const CLIPMAP_CENTER_RADIUS: u32 = 4;
         for (x, row) in self.clipmap.center.iter().enumerate() {
             for (y, coords) in row.iter().enumerate() {
@@ -165,9 +168,12 @@ impl Terrain {
                 color_data.append(&mut entry.1.as_raw().clone());
                 if let Some(v) = &entry.2 {
                     building_vertices.append(&mut v.clone().mesh);
+                    tree_instances.append(&mut v.clone().trees);
                 }
             }
         }
+
+        // ITERATE CLIPMAP RINGS
         let mut top_left_inner = self.origin;
         for (r_idx, ring) in self.clipmap.rings.iter().enumerate() {
                 let scale = util::zoom_to_dist(self.zoom-(r_idx + 1) as u32);
@@ -201,6 +207,7 @@ impl Terrain {
         self.gpu_resources.upload_image_array(color_data, layers as u32, self.gpu_resources.color_array.clone())
             .context("Failed to upload color maps to GPU")?;
 
+        // CREATE VECTOR TILE BUFFERS
         log::info!("Building vertices generated: {}", building_vertices.len());
         if !building_vertices.is_empty() {
             self.gpu_resources.building_vertices = Buffer::from_iter(
@@ -214,6 +221,15 @@ impl Terrain {
                     ..Default::default() 
                 },
                 building_vertices,
+            )?;
+        }
+        log::info!("Trees generated: {}", tree_instances.len());
+        if !tree_instances.is_empty() {
+            self.gpu_resources.tree_instances = Buffer::from_iter(
+                self.gpu_resources.memory_allocator.clone(),
+                BufferCreateInfo { usage: BufferUsage::VERTEX_BUFFER, ..Default::default() },
+                AllocationCreateInfo { memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE, ..Default::default() },
+                tree_instances,
             )?;
         }
 
@@ -347,7 +363,33 @@ impl TerrainGpuResources {
             },
         )?;
 
-        // Garbage init
+        // static images
+        let mut static_texture_views = Vec::new();
+        let mut static_textures = Vec::new();
+
+        for path in [
+            "./assets/tree0.png"
+        ] {
+            let tex = ImageReader::open(path)?.decode()?.into_rgba8();
+            let image = Image::new(
+                memory_allocator.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R8G8B8A8_UNORM,
+                    extent: [tex.width(), tex.height(), 1],
+                    usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )?;
+            static_textures.push((tex.as_raw().clone(), image.clone()));
+
+            let view = ImageView::new_default(image.clone())?;
+            static_texture_views.push(view);
+        }
+        // end static images
+
+        // Garbage init terrain tile instance buffer
         let instance_buffer = Buffer::new_slice(
             memory_allocator.clone(),
             BufferCreateInfo { 
@@ -360,7 +402,7 @@ impl TerrainGpuResources {
             },
             128
         )?;
-        // Garbage init
+        // Garbage init building vertex buffer
         let building_vertex_buffer = Buffer::new_slice(
             memory_allocator.clone(),
             BufferCreateInfo { 
@@ -374,8 +416,16 @@ impl TerrainGpuResources {
             1
         )?;
 
+        // Garbage init tree instance buffer
+        let tree_instance_buffer = Buffer::new_slice(
+            memory_allocator.clone(),
+            BufferCreateInfo { usage: BufferUsage::VERTEX_BUFFER, ..Default::default() },
+            AllocationCreateInfo { memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE, ..Default::default() },
+            1
+        )?;
 
-        Ok(TerrainGpuResources {
+
+        let mut res = TerrainGpuResources {
             memory_allocator,
             queue,
             command_buffer_allocator,
@@ -386,8 +436,18 @@ impl TerrainGpuResources {
             heightmap_array_view,
             color_array,
             color_array_view,
+            static_texture_views,
             building_vertices: building_vertex_buffer,
-        })
+            tree_instances: tree_instance_buffer,
+        };
+
+        // upload static images
+        for (data, img) in static_textures {
+            res.upload_image_array(data, 1, img)
+                .context("Failed to upload heightmaps to GPU")?;
+        }
+
+        Ok(res)
     }
 
     pub fn upload_image_array<T: BufferContents>( &mut self, data: Vec<T>, layers: u32, target: Arc<Image>) -> Result<()> {
@@ -449,7 +509,7 @@ struct Clipmap {
     rings: Vec<[UVec3; 12]>,
 }
 
-const MAX_ZOOM_TERRAIN: u32 = 12;
+const MAX_ZOOM_TERRAIN: u32 = 22;
 impl Clipmap {
     pub fn new(origin: DVec2, zoom: u32, rings: u8) -> Self {
         let mut top_left_tile = Self::find_starting_tile(origin, zoom, rings);

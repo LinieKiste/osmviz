@@ -11,6 +11,7 @@ tile:
         --config /data/config.json \
         --process /data/process.lua
 
+# Start tileserver (requires tmux)
 serve:
     # 1. Create new window named 'tileservers'
     tmux new-window -n tileservers
@@ -36,5 +37,6 @@ serve:
     tmux select-pane -t tileservers.0
     tmux select-pane -R
 
+# Stop tileserver
 stop:
     tmux kill-window -t tileservers

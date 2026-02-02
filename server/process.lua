@@ -70,15 +70,31 @@ function process_building_3d()
     if roof_col ~= "" then Attribute("roof_color", roof_col) end
     if build_col ~= "" then Attribute("building_color", build_col) end
 
+    -- Roof Geometry details
+    local rh = parseHeight(Find("roof:height"))
+    if rh > 0 then AttributeNumeric("roof_height", rh) end
+
+    local rl = tonumber(Find("roof:levels"))
+    if rl then AttributeNumeric("roof_levels", rl) end
+
+    -- Orientation: 'along', 'across', or specific alignment
+    local ro = Find("roof:orientation")
+    if ro ~= "" then Attribute("roof_orientation", ro) end
+
+    -- Direction: 'N', 'S', '45', etc. (Direction of the slope)
+    local rd = Find("roof:direction")
+    if rd ~= "" then Attribute("roof_direction", rd) end
+
     -- 4. Mark if it is a "part"
     if part ~= "" then AttributeBoolean("is_part", true) end
 end
--- --- END COPY ---
+
+-- AI code end
 
 
 -- Nodes will only be processed if one of these keys is present
 
-node_keys = { "amenity", "historic", "leisure", "place", "shop", "tourism" }
+node_keys = { "amenity", "historic", "leisure", "place", "shop", "tourism", "natural"}
 
 
 -- Assign nodes to a layer, and set attributes, based on OSM tags
@@ -112,37 +128,22 @@ function node_function(node)
 			MinZoom(10)
 		end
 	end
+
+        local natural = Find("natural")
+        if natural == "tree" then
+            Layer("natural")
+            Attribute("natural", "tree")
+            MinZoom(12)
+        end
 end
 
 
 -- Assign ways to a layer, and set attributes, based on OSM tags
 
 function way_function()
-        process_building_3d()
 	local highway  = Find("highway")
 	local waterway = Find("waterway")
 	local building = Find("building")
-
-	-- Roads
-	if highway~="" then
-		Layer("transportation", false)
-		if highway=="unclassified" or highway=="residential" then highway="minor" end
-		Attribute("class", highway)
-		-- ...and road names
-		local name = Find("name")
-		if name~="" then
-			Layer("transportation_name", false)
-			Attribute("class", highway)
-			Attribute("name:latin", name)
-		end
-	end
-
-	-- Rivers
-	if waterway=="stream" or waterway=="river" or waterway=="canal" then
-		Layer("waterway", false)
-		Attribute("class", waterway)
-		AttributeInteger("intermittent", 0)
-	end
 
 	-- Lakes and other water polygons
 	if Find("natural")=="water" then
@@ -153,6 +154,7 @@ function way_function()
 			Attribute("class", "lake")
 		end
 	end
+        process_building_3d()
 	-- Buildings
 	-- if building~="" then
 	-- 	Layer("building", true)

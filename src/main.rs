@@ -58,18 +58,22 @@ struct App {
 }
 
 struct RenderContext {
+    camera: Camera,
+    previous_frame_end: Option<Box<dyn GpuFuture>>,
+    recreate_swapchain: bool,
     timestamp: std::time::Instant,
+    wireframe: bool,
+
     gui: Gui,
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
-    render_pass: Arc<RenderPass>,
     framebuffers: Vec<Arc<Framebuffer>>,
+    viewport: Viewport,
+
+    render_pass: Arc<RenderPass>,
     terrain_pipeline: Arc<GraphicsPipeline>,
     building_pipeline: Arc<GraphicsPipeline>,
-    viewport: Viewport,
-    recreate_swapchain: bool,
-    previous_frame_end: Option<Box<dyn GpuFuture>>,
-    camera: Camera,
+    tree_pipeline: Arc<GraphicsPipeline>,
 }
 
 impl App {
@@ -95,6 +99,7 @@ impl App {
         let device_features = DeviceFeatures {
             tessellation_shader: true,
             fill_mode_non_solid: true,
+            shader_sampled_image_array_non_uniform_indexing: true,
             ..DeviceFeatures::empty()
         };
         let (physical_device, queue_family_index) = instance
@@ -219,7 +224,7 @@ impl ApplicationHandler for App {
                     store_op: Store,
                 },
                 depth_stencil: {
-                    format: Format::D16_UNORM,
+                    format: Format::D32_SFLOAT,
                     samples: 1,
                     load_op: Clear,
                     store_op: DontCare,
@@ -247,6 +252,8 @@ impl ApplicationHandler for App {
             .expect("failed to create tessellation pipeline");
         let building_pipeline = self.create_building_pipeline(&render_pass)
             .expect("failed to create building pipeline");
+        let tree_pipeline = self.create_tree_pipeline(&render_pass)
+            .expect("failed to create tree pipeline");
 
         let viewport = Viewport {
             offset: [0.0, 0.0],
@@ -261,12 +268,14 @@ impl ApplicationHandler for App {
         self.rcx = Some(RenderContext {
             timestamp: std::time::Instant::now(),
             gui,
+            wireframe: false,
             window,
             swapchain,
             render_pass,
             framebuffers,
             terrain_pipeline,
             building_pipeline,
+            tree_pipeline,
             viewport,
             recreate_swapchain: false,
             previous_frame_end,
@@ -354,24 +363,41 @@ impl ApplicationHandler for App {
                     [
                     WriteDescriptorSet::buffer(0, camera_ubo.clone()),
                     WriteDescriptorSet::image_view_sampler(1, self.terrain.get_heightmaps(), sampler.clone()),
-                    WriteDescriptorSet::image_view_sampler(2, self.terrain.get_colormaps(), sampler),
+                    WriteDescriptorSet::image_view_sampler(2, self.terrain.get_colormaps(), sampler.clone()),
                     ],
                     [],
                 )
                 .unwrap();
+
+                // tree and building layouts
+                let texture_views = self.terrain.get_tree_textures();
+                let samplers = vec![sampler.clone(); texture_views.len()];
+
+                let image_infos = texture_views.into_iter().zip(samplers.into_iter());
 
                 let building_layout = &rcx.building_pipeline.layout().set_layouts()[0];
                 let descriptor_set_building = DescriptorSet::new(
                     self.descriptor_set_allocator.clone(),
                     building_layout.clone(),
                     [
-                    // We only provide binding 0 (Camera), reusing the same buffer!
-                    WriteDescriptorSet::buffer(0, camera_ubo), 
+                    WriteDescriptorSet::buffer(0, camera_ubo.clone()), 
                     ],
                     [],
                 ).unwrap();
 
-                self.render(&[descriptor_set_terrain, descriptor_set_building], delta_time).expect("Rendering failed!");
+                let tree_layout = &rcx.tree_pipeline.layout().set_layouts()[0];
+                let descriptor_set_trees = DescriptorSet::new(
+                    self.descriptor_set_allocator.clone(),
+                    tree_layout.clone(),
+                    [
+                    WriteDescriptorSet::buffer(0, camera_ubo), 
+                    WriteDescriptorSet::image_view_sampler_array(1, 0, image_infos),
+                    ],
+                    [],
+                ).unwrap();
+
+                self.render(&[descriptor_set_terrain, descriptor_set_building, descriptor_set_trees], delta_time)
+                    .expect("Rendering failed!");
             }
             _ => {}
         }
@@ -394,7 +420,7 @@ fn window_size_dependent_setup(
             memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
-                format: Format::D16_UNORM,
+                format: Format::D32_SFLOAT,
                 extent: images[0].extent(),
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
                 ..Default::default()

@@ -53,14 +53,14 @@ pub struct Camera {
 impl Camera {
     pub fn new(width: f32, height: f32) -> Self {
         Self {
-            position: DVec3::new(21_720., 10., 14_330.), 
+            position: DVec3::new(21_797., 2., 14_214.), 
             yaw: -PI / 2.0, // Look along -Z
             pitch: -PI / 4.0, // Look down 45 degrees
             
             aspect_ratio: width / height,
             fov: 45.0_f32.to_radians(),
-            near: 0.1,
-            far: 24000.0,
+            near: 0.001,
+            far: 2000.0,
 
             speed: 20.0,
             rot_speed: 2.0,

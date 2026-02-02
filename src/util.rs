@@ -3,6 +3,7 @@ use crate::App;
 use crate::TerrainVertex;
 use crate::shaders::*;
 use crate::terrain::TileInstance;
+use crate::vector_tile::TreeInstance;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 
@@ -63,7 +64,7 @@ impl App {
     }
 
     pub fn create_tessellation_pipeline(&self, render_pass: &Arc<RenderPass>) -> Result<Arc<GraphicsPipeline>> {
-        let vs = vs::load(self.device.clone())?
+        let vs = terrain_vs::load(self.device.clone())?
             .entry_point("main")
             .unwrap();
         let tcs = tcs::load(self.device.clone())?
@@ -72,7 +73,7 @@ impl App {
         let tes = tes::load(self.device.clone())?
             .entry_point("main")
             .unwrap();
-        let fs = fs::load(self.device.clone())?
+        let fs = terrain_fs::load(self.device.clone())?
             .entry_point("main")
             .unwrap();
         let vertex_input_state =
@@ -112,7 +113,7 @@ impl App {
                     viewport_state: Some(ViewportState::default()),
                     rasterization_state: Some(RasterizationState {
                         polygon_mode: PolygonMode::Fill,
-                        cull_mode: CullMode::None,
+                        cull_mode: CullMode::Back,
                         ..Default::default()
                     }),
                     depth_stencil_state: Some(DepthStencilState {
@@ -163,13 +164,64 @@ impl App {
                 }),
                 viewport_state: Some(ViewportState::default()),
                 rasterization_state: Some(RasterizationState {
-                    polygon_mode: PolygonMode::Fill,
-                    cull_mode: CullMode::None, // Cull back-faces
-                    front_face: vulkano::pipeline::graphics::rasterization::FrontFace::CounterClockwise,
+                    polygon_mode: PolygonMode::Line,
+                    cull_mode: CullMode::Back,
+                    front_face: vulkano::pipeline::graphics::rasterization::FrontFace::Clockwise,
                     ..Default::default()
                 }),
                 depth_stencil_state: Some(DepthStencilState {
                     depth: Some(DepthState::simple()), // Read/Write depth buffer
+                    ..Default::default()
+                }),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    subpass.num_color_attachments(),
+                    ColorBlendAttachmentState::default(),
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(subpass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )?)
+    }
+
+    pub fn create_tree_pipeline(&self, render_pass: &Arc<RenderPass>) -> Result<Arc<GraphicsPipeline>> {
+        let vs = tree_vs::load(self.device.clone())?.entry_point("main").unwrap();
+        let fs = tree_fs::load(self.device.clone())?.entry_point("main").unwrap();
+
+        // Use TreeInstance per instance, NO per-vertex data (generated in shader)
+        let vertex_input_state = TreeInstance::per_instance().definition(&vs)?;
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        let layout = PipelineLayout::new(
+            self.device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(self.device.clone())?
+        )?;
+        let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+
+        Ok(GraphicsPipeline::new(
+            self.device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                }),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState {
+                    // Disable culling so we see both sides of the crossed quad
+                    cull_mode: CullMode::None, 
+                    ..Default::default()
+                }),
+                depth_stencil_state: Some(DepthStencilState {
+                    depth: Some(DepthState::simple()),
                     ..Default::default()
                 }),
                 multisample_state: Some(MultisampleState::default()),
@@ -213,6 +265,7 @@ impl App {
 
         let instance_buffer = self.terrain.get_instance_buffer();
         let building_vertex_buffer = self.terrain.get_building_vertices();
+        let tree_instances = self.terrain.get_tree_instances();
 
         // draw terrain
         builder
@@ -241,6 +294,14 @@ impl App {
             .bind_vertex_buffers(0, building_vertex_buffer.clone())?;
         unsafe { builder.draw(building_vertex_buffer.len() as u32, 1, 0, 0) }?;
 
+        // draw trees
+        builder
+            .bind_pipeline_graphics(rcx.tree_pipeline.clone())?
+            .bind_descriptor_sets(PipelineBindPoint::Graphics, rcx.tree_pipeline.layout().clone(), 0, descriptor_sets[2].clone())?
+            .bind_vertex_buffers(0, tree_instances.clone())?;
+        // Draw 12 vertices per instance (2 crossed quads = 4 triangles = 12 verts)
+        unsafe { builder.draw(12, tree_instances.len() as u32, 0, 0) }?;
+
         // draw gui
         rcx.gui.immediate_ui(|gui| {
             let ctx = gui.context();
@@ -252,6 +313,8 @@ impl App {
                 if ui.button("Toggle color").clicked() {
                     self.terrain.toggle_api();
                 }
+                ui.checkbox(&mut rcx.wireframe, "Buildings wireframe");
+
                 ui.horizontal_top(
                     |ui| {
                         ui.label("Camera speed");
@@ -316,7 +379,7 @@ pub fn zoom_to_dist(z: u32) -> f64 {
 }
 
 pub fn zoom_from_height(height: f64) -> u32 {
-    (5. + 3000./(height+400.)).clamp(4., 18.) as u32
+    (5. + 800./(height+100.)).clamp(5., 18.) as u32
 }
 
 #[cfg(test)]
