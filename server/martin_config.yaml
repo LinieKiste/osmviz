@@ -1,8 +1,4 @@
 web_ui: enableforall
-mbtiles:
-  sources:
-    terrain: euro-dem-tif/data/eurodem_qgis.mbtiles
-    bayern: bayern-shortbread.mbtiles
 pmtiles:
   sources:
     germany: germany_buildings.pmtiles

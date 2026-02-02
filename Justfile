@@ -23,25 +23,24 @@ assets:
 install:
     cargo install martin
 
-    uv venv
+    UV_VENV_CLEAR=1 uv venv
     source .venv/bin/activate
     uv pip install uvicorn titiler.application
     
-# remove system-wide tools
+# remove system-wide tool
 clean:
     cargo uninstall martin
 
 # Regenerate vector tiles using tilemaker (requires docker)
-[working-directory("server")]
 tile input='germany-latest.osm.pbf' output='germany_buildings.pmtiles':
     docker run -it --rm --pull always -v $(pwd):/data -w /data \
         ghcr.io/systemed/tilemaker:master \
         /data/{{input}} \
-        --output /data/{{output}} \
-        --config /data/config.json \
-        --process /data/process.lua
+        --output /data/server/{{output}} \
+        --config /data/server/config.json \
+        --process /data/server/process.lua
 
-# Start tileserver (requires tmux)
+# Start tileserver (requires you to be in a tmux session)
 [working-directory("server")]
 serve:
     # 1. Create new window named 'tileservers'

@@ -1,14 +1,15 @@
 # osmviz
-Visualizing OSM data in 3D, using vulkano.
-Use `just prep` to initialize everything once you have the data sources.
+Visualizing OSM data in 3D, using vulkano.  
+You will need to have cargo, uv and docker installed for the out-of-the-box setup.  
+Use `just prep` to initialize everything once you have the data sources.  
 
 ### Data sources
 #### Elevation data
-[EuroDEM dataset](https://www.mapsforeurope.org/datasets/euro-dem)
+[EuroDEM dataset](https://www.mapsforeurope.org/datasets/euro-dem)  
 Extract tif file, supply path as argument to `just prep`.
 
 #### OSM map data
-[Geofabrik](https://download.geofabrik.de/europe/germany.html)
+[Geofabrik](https://download.geofabrik.de/europe/germany.html)  
 Provide .osm.pbf as second argument to `just prep`.
 
 #### Color data
