@@ -71,7 +71,7 @@ impl Terrain {
         let zoom = 12;
 
         let mut terrain = Terrain { 
-            use_api: false,
+            use_api: true,
             needs_rebuild: true,
 
             // CPU
