@@ -1,7 +1,8 @@
 # osmviz
 Visualizing OSM data in 3D, using vulkano.  
 You will need to have cargo, uv and docker installed for the out-of-the-box setup.  
-Use `just prep` to initialize everything once you have the data sources.  
+Run `just prep` to initialize everything once you have the data sources.  
+If you're using relative paths as arguments, make sure to run it from this directory.  
 
 ### Data sources
 #### Elevation data
