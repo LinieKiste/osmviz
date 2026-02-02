@@ -15,7 +15,7 @@ app.add_middleware(
 )
 
 def fixed_path(url: str = None):
-    return "/mnt/ubuntu/home/casimir/UNI/WS_25/testing/osmviz/euro-dem-tif/data/eurodem.tif"
+    return "YOURPATH"
 
 # Create a TilerFactory for Cloud-Optimized GeoTIFFs
 cog = TilerFactory(path_dependency=fixed_path)
