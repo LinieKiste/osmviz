@@ -8,7 +8,7 @@ use std::{fmt::format, num::NonZeroUsize, sync::Arc};
 use reqwest::blocking::Client;
 use image::{DynamicImage, ImageReader, RgbaImage};
 use vulkano::{
-    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{AutoCommandBufferBuilder, BufferImageCopy, CommandBufferUsage, CopyBufferToImageInfo, allocator::StandardCommandBufferAllocator}, device::Queue, format::Format, image::{Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage, view::{ImageView, ImageViewCreateInfo, ImageViewType}}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::graphics::vertex_input::Vertex, sync::GpuFuture
+    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{AutoCommandBufferBuilder, BufferImageCopy, CommandBufferUsage, CopyBufferInfo, CopyBufferToImageInfo, allocator::StandardCommandBufferAllocator}, device::Queue, format::Format, image::{Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage, view::{ImageView, ImageViewCreateInfo, ImageViewType}}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, pipeline::graphics::vertex_input::Vertex, sync::GpuFuture
 };
 
 #[derive(BufferContents, Vertex, Default)]
@@ -210,18 +210,7 @@ impl Terrain {
         // CREATE VECTOR TILE BUFFERS
         log::info!("Building vertices generated: {}", building_vertices.len());
         if !building_vertices.is_empty() {
-            self.gpu_resources.building_vertices = Buffer::from_iter(
-                self.gpu_resources.memory_allocator.clone(),
-                BufferCreateInfo { 
-                    usage: BufferUsage::VERTEX_BUFFER, 
-                    ..Default::default() 
-                },
-                AllocationCreateInfo { 
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE, 
-                    ..Default::default() 
-                },
-                building_vertices,
-            )?;
+            self.gpu_resources.building_vertices = self.gpu_resources.upload_buffer(building_vertices, BufferUsage::VERTEX_BUFFER)?;
         }
         log::info!("Trees generated: {}", tree_instances.len());
         if !tree_instances.is_empty() {
@@ -498,6 +487,67 @@ impl TerrainGpuResources {
         future.wait(None)?;
 
         Ok(())
+    }
+
+    pub fn upload_buffer<T: BufferContents>(
+        &self, 
+        data: Vec<T>, 
+        usage: BufferUsage
+    ) -> Result<Subbuffer<[T]>> {
+        let data_len = data.len();
+
+        // 1. Create Staging Buffer (Host Visible, CPU writes here)
+        let staging_buffer = Buffer::from_iter(
+            self.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC, // Source of copy
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                // Ensure we can write to it from CPU
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            data, // Write data immediately
+        )?;
+
+        // 2. Create Device Buffer (Device Local, GPU reads here)
+        let device_buffer = Buffer::new_slice::<T>(
+            self.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: usage | BufferUsage::TRANSFER_DST, // Destination of copy + Original Usage
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                // Strictly prefer VRAM, no CPU access needed
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            data_len as u64,
+        )?;
+
+        // 3. Record Command Buffer to Copy Staging -> Device
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.command_buffer_allocator.clone(),
+            self.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )?;
+
+        builder.copy_buffer(CopyBufferInfo::buffers(
+            staging_buffer,
+            device_buffer.clone(),
+        ))?;
+
+        let command_buffer = builder.build()?;
+
+        // 4. Submit and Wait
+        let future = vulkano::sync::now(self.queue.device().clone())
+            .then_execute(self.queue.clone(), command_buffer)?
+            .then_signal_fence_and_flush()?;
+
+        future.wait(None)?;
+
+        Ok(device_buffer)
     }
 }
 
