@@ -164,7 +164,7 @@ impl App {
                 }),
                 viewport_state: Some(ViewportState::default()),
                 rasterization_state: Some(RasterizationState {
-                    polygon_mode: PolygonMode::Line,
+                    polygon_mode: PolygonMode::Fill,
                     cull_mode: CullMode::Back,
                     front_face: vulkano::pipeline::graphics::rasterization::FrontFace::Clockwise,
                     ..Default::default()
@@ -272,7 +272,8 @@ impl App {
             .begin_render_pass(
                 RenderPassBeginInfo {
                     clear_values: vec![
-                        Some([0.0, 0.0, 0.0, 1.0].into()),
+                        // A nice "Atmospheric" blue instead of [0.0, 0.0, 0.0, 1.0]
+                        Some([0.52, 0.81, 0.92, 1.0].into()), 
                         Some(1f32.into()),
                     ],
                     ..RenderPassBeginInfo::framebuffer(
@@ -313,7 +314,6 @@ impl App {
                 if ui.button("Toggle color").clicked() {
                     self.terrain.toggle_api();
                 }
-                ui.checkbox(&mut rcx.wireframe, "Buildings wireframe");
 
                 ui.horizontal_top(
                     |ui| {

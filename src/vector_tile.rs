@@ -1,5 +1,6 @@
 use rand::Rng;
 use glam::{DVec2, UVec2, Vec2, Vec3};
+use rayon::iter::IntoParallelRefIterator;
 use crate::{util};
 use vulkano::{
     buffer::BufferContents,
@@ -61,6 +62,20 @@ pub struct VectorTile {
     pub trees: Vec<TreeInstance>,
 }
 
+// Helper struct to bundle data for the polygon processor
+struct BuildingContext {
+    top_y: f64,      // Peak height
+    eaves_y: f64,    // Gutter height
+    base_y: f64,     // Ground floor height
+    roof_height: f64,
+    roof_direction: f32,       // Angle in degrees
+    roof_orientation: Option<String>,
+    wall_color: [f32; 3],
+    roof_color: [f32; 3],
+    roof_shape: String,
+    ground_elevation: f64,
+}
+
 impl VectorTile {
     pub fn new(client: &Client, coords: UVec3, heightmap: &RgbaImage) -> Result<Self> {
         let UVec3 { x, y, z} = coords;
@@ -92,6 +107,17 @@ impl VectorTile {
 
         for feature in &buildings_layer.features {
             let Ok(geo) = feature.to_geo() else { continue };
+
+            let centroid_geo = geo.centroid().unwrap_or(point!{x: 0.0, y: 0.0});
+            let centroid_world = transform(centroid_geo.0); // Convert to world space
+            
+            let ground_elevation = sample_terrain_height(
+                heightmap, 
+                tile_origin, 
+                tile_width, 
+                centroid_world.x, 
+                centroid_world.y
+            );
 
             // --- Parsing OSM Tags ---
             let total_height: f64 = get_prop(feature, buildings_layer, "height").map(|x| x.float_value())
@@ -144,9 +170,7 @@ impl VectorTile {
                 wall_color: parse_osm_color(wall_hex.as_deref().unwrap_or("default")),
                 roof_color: parse_osm_color(roof_hex.as_deref().unwrap_or("roof_default")),
                 roof_shape: roof_shape_tag, 
-                tile_origin,
-                tile_width,
-                heightmap,
+                ground_elevation,
             };
 
             // 3. Process Geometry
@@ -231,42 +255,11 @@ impl VectorTile {
         })
     }
 }
-// Helper struct to bundle data for the polygon processor
-struct BuildingContext<'a> {
-    top_y: f64,      // Peak height
-    eaves_y: f64,    // Gutter height
-    base_y: f64,     // Ground floor height
-    roof_height: f64,
-    roof_direction: f32,       // Angle in degrees
-    roof_orientation: Option<String>,
-    wall_color: [f32; 3],
-    roof_color: [f32; 3],
-    roof_shape: String,
-    tile_origin: DVec2,
-    tile_width: f64,
-    heightmap: &'a RgbaImage,
-}
 
-impl<'a> BuildingContext<'a> {
+impl BuildingContext {
     // Helper to sample height at a specific WORLD X/Z coordinate
     fn sample_ground(&self, world_x: f64, world_z: f64) -> f64 {
-        // 1. Calculate UV relative to the tile
-        // Note: world_z corresponds to Y in the tile texture space
-        let uv = (DVec2::new(world_x, world_z) - (self.tile_origin - util::WORLD_ORIGIN)) / self.tile_width;
-        let uv = uv.clamp(DVec2::ZERO, DVec2::ONE);
-
-        // 3. Map to pixel coordinates
-        // Assuming 256x256 image. -1 to ensure we don't go out of bounds at 1.0
-        let wh: UVec2 = self.heightmap.dimensions().into();
-        let p = (uv * (wh-UVec2::ONE).as_dvec2()).round().as_uvec2();
-
-        // 4. Sample and Scale
-        let pixel = self.heightmap.get_pixel(p.x, p.y);
-        let r = pixel[0] as f64;
-        let g = pixel[1] as f64;
-        let b = pixel[2] as f64;
-        let height_meters = -10000.0 + ((r * 256.0 * 256.0 + g * 256.0 + b) * 0.1);
-        height_meters / 1000.0
+        self.ground_elevation
     }
 }
 
@@ -329,18 +322,27 @@ fn create_hipped_roof(
 ) -> Vec<BuildingVertex> {
     let mut vertices = Vec::new();
     
-    // Attempt to buffer (inset) the polygon
+    // 1. Generate the inner "ridge" polygons
     let buffered_multi = buffer_polygon(poly, -inset);
     
-    let mut generated_any = false;
-    for inner_poly in buffered_multi {
-        generated_any = true;
-        
-        // 1. Loft: Eaves -> Ridge
-        vertices.extend(loft_polygons(poly, &inner_poly, ctx.eaves_y, ridge_y, ctx));
+    // 2. Collect ALL inner rings to act as holes for the slope generation
+    //    If the building is L-shaped, buffer_polygon returns 2+ polygons.
+    //    We must treat them all as holes in ONE loft operation to avoid overlapping meshes.
+    let mut inner_rings = Vec::new();
+    for inner_poly in &buffered_multi {
+        inner_rings.push(inner_poly.clone());
+    }
 
-        // 2. Cap: Flat Ridge (if any area remains)
-        // For a perfect pyramid, this area is near zero, but earcut handles it.
+    if inner_rings.is_empty() {
+         return create_pyramidal_roof(poly, ctx);
+    }
+
+    // 3. Loft the Slope (One pass for the whole building)
+    //    This creates the angled roof surface between the Eaves (outer) and ALL Ridges (inners)
+    vertices.extend(loft_polygons(poly, &inner_rings, ctx.eaves_y, ridge_y, ctx));
+
+    // 4. Cap the Ridges (Flat top parts)
+    for inner_poly in buffered_multi {
         let triangulation = inner_poly.earcut_triangles_raw();
         for idx in triangulation.triangle_indices {
             let p = DVec2::new(triangulation.vertices[idx * 2], triangulation.vertices[idx * 2 + 1]);
@@ -348,12 +350,6 @@ fn create_hipped_roof(
             let pos = Vec3::new(p.x as f32, (ridge_y + ground) as f32, p.y as f32);
             vertices.push(BuildingVertex { position: pos.to_array(), color: ctx.roof_color });
         }
-    }
-
-    // Fallback: If the inset consumed the whole polygon (e.g. narrow building, tall roof),
-    // we fallback to a Pyramidal roof which peaks at the centroid.
-    if !generated_any {
-        return create_pyramidal_roof(poly, ctx);
     }
 
     vertices
@@ -553,63 +549,85 @@ fn process_walls(poly: &geo::Polygon<f64>, ctx: &BuildingContext) -> Vec<Buildin
     vertices
 }
 
-// Helper: Lofting (Connects two polygon rings)
 fn loft_polygons(
     outer: &geo::Polygon<f64>, 
-    inner: &geo::Polygon<f64>, 
+    inners: &[geo::Polygon<f64>], // Now accepts multiple inner polygons
     y_outer: f64, 
     y_inner: f64, 
     ctx: &BuildingContext
 ) -> Vec<BuildingVertex> {
-    let mut vertices = Vec::new();
-    let outer_ring: Vec<_> = outer.exterior().coords_iter().collect();
-    let inner_ring: Vec<_> = inner.exterior().coords_iter().collect();
-
-    for i in 0..outer_ring.len() - 1 {
-        let p1 = DVec2::new(outer_ring[i].x, outer_ring[i].y);
-        let p2 = DVec2::new(outer_ring[i+1].x, outer_ring[i+1].y);
-
-        // Find closest points on inner ring (Naive stitching)
-        let i1 = find_closest_index(p1, &inner_ring);
-        let i2 = find_closest_index(p2, &inner_ring);
-
-        let ip1 = DVec2::new(inner_ring[i1].x, inner_ring[i1].y);
-        let ip2 = DVec2::new(inner_ring[i2].x, inner_ring[i2].y);
-
-        let g1 = ctx.sample_ground(p1.x, p1.y);
-        let g2 = ctx.sample_ground(p2.x, p2.y);
-        let gi1 = ctx.sample_ground(ip1.x, ip1.y);
-        let gi2 = ctx.sample_ground(ip2.x, ip2.y);
-
-        let v1 = Vec3::new(p1.x as f32, (y_outer + g1) as f32, p1.y as f32);
-        let v2 = Vec3::new(p2.x as f32, (y_outer + g2) as f32, p2.y as f32);
-        let vi1 = Vec3::new(ip1.x as f32, (y_inner + gi1) as f32, ip1.y as f32);
-        let vi2 = Vec3::new(ip2.x as f32, (y_inner + gi2) as f32, ip2.y as f32);
-
-        // T1: P1 -> P2 -> IP1
-        vertices.push(BuildingVertex { position: v1.to_array(), color: ctx.roof_color });
-        vertices.push(BuildingVertex { position: v2.to_array(), color: ctx.roof_color });
-        vertices.push(BuildingVertex { position: vi1.to_array(), color: ctx.roof_color });
-
-        // T2: P2 -> IP2 -> IP1 (Fill gap)
-        if i1 != i2 {
-             vertices.push(BuildingVertex { position: v2.to_array(), color: ctx.roof_color });
-             vertices.push(BuildingVertex { position: vi2.to_array(), color: ctx.roof_color });
-             vertices.push(BuildingVertex { position: vi1.to_array(), color: ctx.roof_color });
-        }
+    // 1. Prepare the Holes List
+    // The 'holes' for our slope polygon include:
+    //  a. The original building's holes (e.g. courtyards) -> These should be at EAVES height
+    //  b. The buffered inner polygons (ridges) -> These should be at RIDGE height
+    
+    let mut holes = Vec::new();
+    
+    // Add original holes (Courtyards)
+    for hole in outer.interiors() {
+        holes.push(hole.clone());
     }
-    vertices
-}
+    let courtyard_hole_count = holes.len();
 
-fn find_closest_index(pt: DVec2, ring: &[geo::Coord]) -> usize {
-    ring.iter().enumerate()
-        .min_by(|(_, a), (_, b)| {
-            let da = DVec2::new(a.x, a.y).distance_squared(pt);
-            let db = DVec2::new(b.x, b.y).distance_squared(pt);
-            da.total_cmp(&db)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    // Add ridge holes
+    for inner in inners {
+        holes.push(inner.exterior().clone());
+    }
+
+    // 2. Construct the "Slope" Polygon
+    let poly = geo::Polygon::new(
+        outer.exterior().clone(),
+        holes,
+    );
+
+    // 3. Triangulate
+    let triangulation = poly.earcut_triangles_raw();
+    
+    let mut vertices = Vec::new();
+
+    // 4. Determine Vertex Heights
+    // Earcut flattens all rings into a single buffer: [Exterior, Hole1, Hole2, ...]
+    // We need to map the index back to which ring it belongs to.
+    
+    let mut offset = 0;
+    
+    // Range for Exterior Ring (Eaves)
+    let ext_len = outer.exterior().coords_count();
+    let range_exterior = offset..(offset + ext_len);
+    offset += ext_len;
+
+    // Range for Courtyard Holes (Eaves)
+    let mut range_courtyards = Vec::new();
+    for hole in outer.interiors() {
+        let len = hole.coords_count();
+        range_courtyards.push(offset..(offset + len));
+        offset += len;
+    }
+
+    // Anything after this belongs to the Ridge Holes (Inner Height)
+    let split_index = offset; 
+
+    for idx in triangulation.triangle_indices {
+        let idx_usize = idx as usize;
+        let x = triangulation.vertices[idx_usize * 2];
+        let z = triangulation.vertices[idx_usize * 2 + 1];
+
+        // Decide Height
+        let y = if idx_usize < split_index {
+            y_outer // It's part of the exterior or a courtyard wall
+        } else {
+            y_inner // It's part of the ridge
+        };
+
+        let ground = ctx.sample_ground(x, z);
+
+        vertices.push(BuildingVertex {
+            position: [x as f32, (y + ground) as f32, z as f32],
+            color: ctx.roof_color,
+        });
+    }
+
+    vertices
 }
 
 /// Helper to parse standard OSM colors and Hex codes
@@ -681,5 +699,23 @@ fn parse_direction_tag(val: &mvt::tile::Value) -> f32 {
         "NNW" => 337.5,
         val => val.parse::<f32>().unwrap_or(0.0),
     }
+}
+
+fn sample_terrain_height(
+    heightmap: &RgbaImage,
+    tile_origin: DVec2,
+    tile_width: f64,
+    world_x: f64,
+    world_z: f64
+) -> f64 {
+    let uv = (DVec2::new(world_x, world_z) - (tile_origin - util::WORLD_ORIGIN)) / tile_width;
+    let uv = uv.clamp(DVec2::ZERO, DVec2::ONE);
+
+    let wh: UVec2 = heightmap.dimensions().into();
+    let p = (uv * (wh-UVec2::ONE).as_dvec2()).round().as_uvec2();
+
+    let pixel = heightmap.get_pixel(p.x, p.y);
+    let height_meters = -10000.0 + ((pixel[0] as f64 * 65536.0 + pixel[1] as f64 * 256.0 + pixel[2] as f64) * 0.1);
+    height_meters / 1000.0
 }
 

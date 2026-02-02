@@ -2,16 +2,47 @@
 default:
     @just --list
 
-# Regenerate vector tiles using tilemaker
-tile:
+# Prepare everything. Requires an elevation .tif and an OSM extract (.osm.pbf)
+prep tif pbf:
+    #!/usr/bin/env bash
+    set -euxo pipefail
+    realtif=`readlink -f {{tif}}`
+    sed -i -e "s|YOURPATH|$realtif|g" ./server/main.py
+    just assets
+    just install
+    just tile {{pbf}}
+
+# Fetch assets
+assets:
+    mkdir -p assets
+    wget https://www.techmonkeybusiness.com/galleries/Texture_Galleries/Billboard_Trees/images/001-Bigtree1.png -O assets/tree0.png 
+    wget https://www.techmonkeybusiness.com/galleries/Texture_Galleries/Billboard_Trees/images/000-bigtree2.png -O assets/tree0.png 
+
+# install server tools, just clean to uninstall
+[working-directory("server")]
+install:
+    cargo install martin
+
+    uv venv
+    source .venv/bin/activate
+    uv pip install uvicorn titiler.application
+    
+# remove system-wide tools
+clean:
+    cargo uninstall martin
+
+# Regenerate vector tiles using tilemaker (requires docker)
+[working-directory("server")]
+tile input='germany-latest.osm.pbf' output='germany_buildings.pmtiles':
     docker run -it --rm --pull always -v $(pwd):/data -w /data \
         ghcr.io/systemed/tilemaker:master \
-        /data/germany-latest.osm.pbf \
-        --output /data/germany_buildings.pmtiles \
+        /data/{{input}} \
+        --output /data/{{output}} \
         --config /data/config.json \
         --process /data/process.lua
 
 # Start tileserver (requires tmux)
+[working-directory("server")]
 serve:
     # 1. Create new window named 'tileservers'
     tmux new-window -n tileservers
